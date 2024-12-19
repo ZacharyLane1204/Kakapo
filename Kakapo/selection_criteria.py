@@ -105,7 +105,7 @@ class Implement_reductions:
             y = cluster['ycentroid'].mean()
             
             sig_max, sig_med, lc_sig, indices = self._check_lc_significance(frame_min, frame_max, x, y, 1, 
-                                                                            buffer = 1.1, base_range=1.6, grad_val = -100)
+                                                                            buffer = 1.3, base_range=1.8, grad_val = -100)
             if sig_med < siglim:
                 continue
             
@@ -143,7 +143,7 @@ class Implement_reductions:
 
             return full_events, events_filtered 
    
-    def _check_lc_significance(self, start, end, x, y, flux_sign, buffer = 1.1, base_range=1.6, grad_val = -100):
+    def _check_lc_significance(self, start, end, x, y, flux_sign, buffer = 1.3, base_range=1.8, grad_val = -100):
         cadence = self.time[1] - self.time[0]
         cadence = cadence.value
         
