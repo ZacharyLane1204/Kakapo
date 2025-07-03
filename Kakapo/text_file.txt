@@ -1,0 +1,74 @@
+"fluxes = forced_photometry(diff, x, y, epsf_data)
+fluxes = correction_smoothing_lightcurve(fluxes, distances < 0.25, window=35, sigma=5)
+fluxes = wavelet_denoise(fluxes, wavelet='coif5', level=3, keep='low', mode = 'symmetric')"
+
+where "forced_photometry" is fine but when I do "correction_smoothing_lightcurve" I get horizontal lines where some of the times it gets plotted against go to 0 when it previously hadn't been. "def correction_smoothing_lightcurve(flux, low_motion, window=35, sigma=2):
+    """
+    Smooth and detrend a lightcurve using rolling cubic splines (local) and
+    global PCHIP spline interpolation. Reweights to favor low_motion points,
+    and clips outliers using a locally computed IQR-like threshold.
+
+    Parameters:
+    -----------
+    flux : array-like
+        The 1D lightcurve array with possible NaNs.
+    low_motion : array-like
+        Boolean mask indicating low-motion frames to prioritize in fitting.
+    window : int
+        Rolling window size for local cubic spline fitting.
+    sigma : float
+        Threshold multiplier for clipping outliers based on local percentile width.
+
+    Returns:
+    --------
+    detrended_flux : np.ndarray
+        Smoothed/detrended flux array.
+    """
+    flux = np.asarray(flux)
+    low_motion = np.asarray(low_motion)
+    x = np.arange(len(flux))
+    detrended = np.full_like(flux, np.nan, dtype=float)
+
+    for i in range(len(flux)):
+        lo = max(0, i - window // 2)
+        hi = min(len(flux), i + window // 2 + 1)
+
+        x_win = x[lo:hi]
+        y_win = flux[lo:hi]
+        weights = low_motion[lo:hi].astype(float)
+
+        # Ignore NaNs
+        mask = ~np.isnan(y_win)
+        if np.sum(mask) < 4:  # not enough points for cubic spline
+            continue
+
+        x_fit = x_win[mask]
+        y_fit = y_win[mask]
+        w_fit = weights[mask]
+
+        # Compute local threshold based on percentiles
+        p84 = np.percentile(y_fit, 84)
+        p16 = np.percentile(y_fit, 16)
+        iqr_like = p84 - p16
+        threshold = sigma * iqr_like
+
+        # try:
+        cs = CubicSpline(x_fit, y_fit, bc_type='natural')
+        local_pred = cs(x[i])
+        if np.abs(flux[i] - local_pred) < threshold:
+            detrended[i] = local_pred
+        else:
+            detrended[i] = np.nan  # Clip
+        # except Exception:
+        #     continue  # Leave as NaN if fit fails
+
+    # Global PCHIP spline interpolation on result
+    mask_final = ~np.isnan(detrended)
+    if np.sum(mask_final) > 4:
+        # try:
+        global_spline = PchipInterpolator(x[mask_final], detrended[mask_final])
+        detrended = global_spline(x)
+        # except Exception:
+        #     pass  # Leave as-is if global fit fails
+
+    return detrended" is my function, can I create NaN's at the bad points or some other method so I do not get horizontal lines in my figures.

@@ -9,6 +9,9 @@ from photutils.detection import DAOStarFinder, StarFinder
 
 import os
 from tqdm import tqdm
+from copy import deepcopy
+
+from scipy.ndimage import center_of_mass, shift
 
 from Kakapo.gaia_matching import get_gaia_region
 
@@ -108,8 +111,23 @@ def epsf_data_creation(tpfs_res, path = '/Users/zgl12/Python_Scripts/K2/', overw
         # plt.savefig('epsf.png', dpi = 900, bbox_inches='tight')
         # plt.show()
         
-        np.savetxt(file, epsf.data)
-        
+        # temp_epsf_data = deepcopy(epsf.data)
+        # temp_epsf_data[temp_epsf_data < 0] = 0
+        # temp_epsf_data = temp_epsf_data[5:-5,5:-5]
+        # com = center_of_mass(temp_epsf_data)
+
+        # ny, nx = epsf.data.shape
+        # center_y, center_x = (ny - 1) / 2, (nx - 1) / 2
+
+        # full_com_y = com[0] + 5
+        # full_com_x = com[1] + 5
+
+        # shift_y = center_y - full_com_y
+        # shift_x = center_x - full_com_x
+
+        # epsf_data = shift(epsf.data, shift=(shift_y, shift_x), order=3)
         epsf_data = epsf.data
+        np.savetxt(file, epsf_data)
+        
     return epsf_data
     
