@@ -10,11 +10,20 @@ from scipy.ndimage import median_filter
 from scipy.ndimage import label
 
 from statsmodels.nonparametric.smoothers_lowess import lowess
+from statsmodels.robust.scale import mad
+
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C
+from sklearn.gaussian_process import GaussianProcessRegressor
 
 import george
 from george import kernels
 
 from astropy.stats import sigma_clipped_stats
+
+# import celerite2
+# from celerite2 import GaussianProcess
+# from celerite2.terms import xpSquaredTerm, RealTerm
+# from celerite2.terms import SHOTerm, RealTerm
 
 import matplotlib.pyplot as plt
 
@@ -386,8 +395,6 @@ def flatten_and_mask_outliers(flux, mask=None, gp_kernel=None, gp_scale=11, outl
     # Estimate robust σ using inter-percentile range
     _, _, iqr = sigma_clipped_stats(flux_flat, sigma = 4)
     sigma_clip = outlier_sigma * iqr
-    # print(sigma_clip)
-    # sigma_clip = 175
 
     outliers = (np.abs(flux_flat) > sigma_clip) & np.isfinite(flux_flat)
 
@@ -403,3 +410,97 @@ def flatten_and_mask_outliers(flux, mask=None, gp_kernel=None, gp_scale=11, outl
     print(f"Number of outliers: {np.sum(outliers)}")
 
     return flux, flux_flat, outliers
+
+def gauss_smooth(time, flux, flux_error=None, n_samples=11):
+    kernel = (C(0.1) * RBF(length_scale=3.0) +
+              C(1e-4, (5e-5, 5e-3)) * RBF(length_scale=0.25, length_scale_bounds=(0.05, 0.5)) +
+              WhiteKernel(noise_level=1e-2))
+
+    base_alpha_values = [0.05, 0.15, 0.25]
+    weights_norm = 1
+
+    for base_alpha in base_alpha_values:
+        try:
+            
+            alpha_per_point = (base_alpha / weights_norm) ** 2
+            if flux_error is not None:
+                max_var = np.nanpercentile(flux_error**2, 95)  # or a fixed ceiling
+                # alpha = np.minimum(flux_error**2, max_var) + alpha_per_point
+                alpha = (flux_error**2) + alpha_per_point
+            else:
+                alpha = alpha_per_point
+
+            gp = GaussianProcessRegressor(kernel=kernel,
+                                          alpha=alpha,
+                                          normalize_y=True,
+                                          optimizer=None)
+            gp.fit(time[:, None], flux)
+
+            samples = gp.sample_y(time[:, None], n_samples=n_samples) # GP draws
+            sampled_mean = samples.mean(axis=1)
+            sampled_std  = samples.std(axis=1)
+
+           
+            _, gp_std = gp.predict(time[:, None], return_std=True) # GP predictive std
+
+            residuals = flux - sampled_mean # Residual scatter (MAD-based, robust)
+            local_scatter = mad(residuals)
+
+            total_std = np.sqrt(gp_std**2 + sampled_std**2 + local_scatter**2) # Final error = quadrature of GP std, sample scatter, and residual scatter
+
+            return sampled_mean, 2 * total_std  # mean + error band
+        except Exception:
+            continue
+
+    mean_pred = PchipInterpolator(time, flux)(time)
+    std_pred = np.full_like(mean_pred, np.std(flux))
+    return mean_pred, std_pred
+
+def weighted_value_and_uncertainty(data, uncertainties):
+
+    # Calculate weights as the inverse of the uncertainties squared
+    weights = 1 / uncertainties**2
+    weighted_mean = np.nansum(weights * data) / np.nansum(weights)
+    weighted_uncertainty = np.sqrt(1 / np.nansum(weights))
+
+    return weighted_mean, weighted_uncertainty
+
+def binned_averages(time, flux, flux_err, bin_size = 3):
+
+    num_data_points = len(time)
+    
+    points_per_bin = bin_size * 2
+    
+    num_bins = num_data_points // points_per_bin
+    remainder = num_data_points % points_per_bin
+    
+    if remainder > 0:
+        num_bins += 1
+
+    blc, bins_median, bins_std = errors(time, flux, flux_err, num_bins, points_per_bin)
+
+    return blc, bins_median, bins_std
+
+def errors(time, flux, flux_err, num_bins, points_per_bin):
+    bins_median = []
+    bins_std = []
+    blc = []
+    # print('Number of bins:', num_bins)
+    for i in range(num_bins):
+        start = i * points_per_bin
+        end = (i + 1) * points_per_bin
+        
+        bin_time = time[start:end]
+        bin_flux = flux[start:end]
+        bin_flux_err = flux_err[start:end]
+        
+        blc.append(np.nanmean(bin_time))
+        med, std = weighted_value_and_uncertainty(bin_flux, bin_flux_err)
+        bins_median.append(med)
+        bins_std.append(std)
+
+    blc = np.array(blc)
+    bins_median = np.array(bins_median)
+    bins_std = np.array(bins_std)
+    
+    return blc, bins_median, bins_std

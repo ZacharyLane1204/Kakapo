@@ -1,0 +1,20 @@
+#   X    Y
+image;box( 678,  30,7,7) # color=green
+image;box( 738,  94,7,7) # color=green
+image;box( 963,  30,7,7) # color=green
+image;box( 672, 232,7,7) # color=green
+image;box( 726, 172,7,7) # color=green
+image;box(1038, 227,7,7) # color=green
+image;box( 686, 300,7,7) # color=green
+image;box( 740, 367,7,7) # color=green
+image;box( 983, 360,7,7) # color=green
+image;box(1049, 283,7,7) # color=green
+image;box( 741, 483,7,7) # color=green
+image;box( 928, 473,7,7) # color=green
+image;box(1024, 467,7,7) # color=green
+image;box( 939, 579,7,7) # color=green
+image;box( 627, 756,7,7) # color=green
+image;box( 836, 734,7,7) # color=green
+image;box( 851, 760,7,7) # color=green
+image;box(1060, 706,7,7) # color=green
+image;box( 547, 905,7,7) # color=green

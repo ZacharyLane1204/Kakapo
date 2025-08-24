@@ -40,19 +40,21 @@ def make_err_model_from_local(raw_flux, smooth_flux, flux_err, baseline_mask, w_
         _, mad_local = rolling_median_mad(raw_flux, w=w_mad)
     else:
         _, mad_local = rolling_median_mad(smooth_flux, w=w_mad)
-    
+    # fallback
     global_mad = np.nanmedian(np.abs((raw_flux if raw_flux is not None else smooth_flux) - 
-                                     np.nanmedian(raw_flux if raw_flux is not None else smooth_flux))) # fallback
+                                     np.nanmedian(raw_flux if raw_flux is not None else smooth_flux)))
     mad_local = np.where((~np.isfinite(mad_local)) | (mad_local == 0), global_mad, mad_local)
     err = np.empty_like(smooth_flux, dtype=float)
     # baseline: prefer empirical mad but don't go below measurement error if available
     err[baseline_mask] = np.maximum(mad_local[baseline_mask], flux_err[baseline_mask] if flux_err is not None else mad_local[baseline_mask])
-    tmask = ~baseline_mask # transient: keep measured error or local mad
+    # transient: keep measured error or local mad
+    tmask = ~baseline_mask
     if flux_err is not None:
         err[tmask] = np.maximum(flux_err[tmask], mad_local[tmask])
     else:
-        err[tmask] = mad_local[tmask] 
-    err[~np.isfinite(err)] = float(global_mad if np.isfinite(global_mad) and global_mad > 0 else 1.0) # fix NaNs
+        err[tmask] = mad_local[tmask]
+    # fix NaNs
+    err[~np.isfinite(err)] = float(global_mad if np.isfinite(global_mad) and global_mad > 0 else 1.0)
     return err
 
 def adapt_z_enter_from_local(flux, center_idx, half_window=100, base_z=2.5, clamp=(0.6, 3.0)):
@@ -103,34 +105,43 @@ def iterative_baseline_zscore_fast(time,
     if not np.any(finite):
         return None, None, None, None, None, None, None
 
-    try: # initial stable baseline using your stable_mask (or simple rolling mad fallback)
+    # initial stable baseline using your stable_mask (or simple rolling mad fallback)
+    try:
         stab = stable_mask(flux_smooth, w=base_w, z_tol=1.5)
     except Exception:
-        stab = finite.copy() # fallback: any finite points
+        # fallback: any finite points
+        stab = finite.copy()
 
     if np.sum(stab & finite) < want_baseline_pts:
-        if frame_min is not None: # fallback to a causal mask or all finite
+        # fallback to a causal mask or all finite
+        if frame_min is not None:
             stab = causal_baseline_mask(flux_smooth, end_idx=max(0, frame_min), min_pts=want_baseline_pts, max_lookback=2000)
         else:
             stab = finite.copy()
 
-    med = float(np.nanmedian(flux_smooth[stab & finite])) # initial med/mad on smoothed baseline candidate
+    # initial med/mad on smoothed baseline candidate
+    med = float(np.nanmedian(flux_smooth[stab & finite]))
     mad = 1.4826 * float(np.nanmedian(np.abs(flux_smooth[stab & finite] - med)))
     if not np.isfinite(mad) or mad == 0:
         mad = float(np.nanstd(flux_smooth[stab & finite])) if np.any(np.isfinite(flux_smooth[stab & finite])) else 1.0
 
     z = (flux_smooth - med) / mad
 
-    if frame_min is not None and frame_max is not None: # initial detection window: use frame_min/frame_max as seed if provided
-        win_lo = max(0, int(frame_min) - 1) # restrict to region around cluster first
+    # initial detection window: use frame_min/frame_max as seed if provided
+    if frame_min is not None and frame_max is not None:
+        # restrict to region around cluster first
+        win_lo = max(0, int(frame_min) - 1)
         win_hi = min(N, int(frame_max) + 2)
-        center_idx = int((frame_min + frame_max) // 2) # compute local adaptive z_enter using center of cluster
+        # compute local adaptive z_enter using center of cluster
+        center_idx = int((frame_min + frame_max) // 2)
         z_enter = adapt_z_enter_from_local(flux_smooth, center_idx, half_window=rolling_w_for_adapt//2, base_z=z_enter_base)
         istart, iend = find_event_window_from_z(z, z_enter=z_enter, z_exit=z_exit, persist=persist)
-        if istart is None: # fallback: if no event found from z, use the provided frame_min/frame_max region
+        # fallback: if no event found from z, use the provided frame_min/frame_max region
+        if istart is None:
             istart, iend = max(0, int(frame_min)), min(N-1, int(frame_max))
     else:
-        center_idx = N//2 # try global
+        # try global
+        center_idx = N//2
         z_enter = adapt_z_enter_from_local(flux_smooth, center_idx, half_window=rolling_w_for_adapt//2, base_z=z_enter_base)
         istart, iend = find_event_window_from_z(z, z_enter=z_enter, z_exit=z_exit, persist=persist)
         if istart is None:
@@ -146,12 +157,13 @@ def iterative_baseline_zscore_fast(time,
         baseline_mask = (~mask_transient) & finite
 
         if np.sum(baseline_mask) < want_baseline_pts:
-            baseline_mask = stab & finite # fall back to stab / causal growth
+            # fall back to stab / causal growth
+            baseline_mask = stab & finite
             if np.sum(baseline_mask) < want_baseline_pts and (frame_min is not None):
                 baseline_mask = causal_baseline_mask(flux_smooth, end_idx=max(0, frame_min), min_pts=want_baseline_pts, max_lookback=2000)
 
-        
-        if np.any(baseline_mask): # recompute med/mad on baseline (smoothed flux)
+        # recompute med/mad on baseline (smoothed flux)
+        if np.any(baseline_mask):
             baseline_med = float(np.nanmedian(flux_smooth[baseline_mask]))
             baseline_mad = 1.4826 * float(np.nanmedian(np.abs(flux_smooth[baseline_mask] - baseline_med)))
             if not np.isfinite(baseline_mad) or baseline_mad == 0:
@@ -161,23 +173,28 @@ def iterative_baseline_zscore_fast(time,
 
         z = (flux_smooth - baseline_med) / baseline_mad
 
-        center_idx = int(max(0, min(N - 1, (prev_istart + prev_iend) // 2))) # adapt z_enter from local baseline noise around center of previous event
+        # adapt z_enter from local baseline noise around center of previous event
+        center_idx = int(max(0, min(N - 1, (prev_istart + prev_iend) // 2)))
         z_enter = adapt_z_enter_from_local(flux_smooth, center_idx, half_window=rolling_w_for_adapt//2, base_z=z_enter_base)
 
         new_istart, new_iend = find_event_window_from_z(z, z_enter=z_enter, z_exit=z_exit, persist=persist)
-        if new_istart is None: # if nothing new, keep previous
-            break # convergence check (allow tiny shifts)
+        if new_istart is None:
+            # if nothing new, keep previous
+            break
+        # convergence check (allow tiny shifts)
         if (new_istart == prev_istart) and (new_iend == prev_iend):
             prev_istart, prev_iend = new_istart, new_iend
             break
         prev_istart, prev_iend = new_istart, new_iend
 
-    evt_len = max(1, prev_iend - prev_istart + 1) # final baseline mask and error model
+    # final baseline mask and error model
+    evt_len = max(1, prev_iend - prev_istart + 1)
     pad = int(max(10, min(500, pad_frac * evt_len)))
     mask_transient = np.zeros(N, bool)
     mask_transient[max(0, prev_istart - pad): min(N, prev_iend + pad + 1)] = True
     final_baseline_mask = (~mask_transient) & finite
-    if np.nansum(final_baseline_mask) < want_baseline_pts: # fallback safeguard
+    # fallback safeguard
+    if np.sum(final_baseline_mask) < want_baseline_pts:
         final_baseline_mask = stab & finite
 
     final_med = float(np.nanmedian(flux_smooth[final_baseline_mask]))
@@ -226,6 +243,43 @@ def stable_mask(x, w=21, z_tol=1.5):
     mad = np.where((~np.isfinite(mad)) | (mad == 0), np.nanmedian(np.abs(x - np.nanmedian(x))) * 1.4826, mad)
     z = (x - med) / mad
     return np.isfinite(z) & (np.abs(z) < z_tol)
+
+def grow_causal(mask, end_idx, want_min=60, max_lookback=3000, step=32):
+    """
+    Grow baseline mask to the left (causal) until it has ≥ want_min finite points
+    (or ≥ min_pts=40 if want_min unattainable).
+    """
+    min_pts = min(40, want_min)  # hard floor 40
+    m = np.zeros_like(mask, dtype=bool)
+    L = step
+    left = max(0, end_idx - L)
+    m[left:end_idx] = mask[left:end_idx]
+    while (np.sum(m) < want_min) and (left > 0) and ((end_idx - left) < max_lookback):
+        add = min(step, left)
+        left -= add
+        m[left:end_idx] |= mask[left:end_idx]
+        if np.sum(m) >= min_pts and (end_idx - left) >= step:
+            # allow early stop if at least min_pts and still flat
+            pass
+    return m
+
+def grow_anti_causal(mask, start_idx, want_min=60, max_lookahead=3000, step=32, N=None):
+    """
+    Grow baseline mask to the right (anti-causal) until it has ≥ want_min finite points.
+    """
+    if N is None: 
+        N = mask.size
+    min_pts = min(40, want_min)
+    m = np.zeros_like(mask, dtype=bool)
+    R = min(start_idx + step, N)
+    m[start_idx:R] = mask[start_idx:R]
+    while (np.sum(m) < want_min) and (R < N) and ((R - start_idx) < max_lookahead):
+        add = min(step, N - R)
+        R += add
+        m[start_idx:R] |= mask[start_idx:R]
+        if np.sum(m) >= min_pts and (R - start_idx) >= step:
+            pass
+    return m
 
 def choose_lower_baseline(f, left_mask, right_mask):
     """
@@ -278,11 +332,86 @@ def find_event_window_from_z(z, z_enter=2.5, z_exit=1.0, persist=2):
         iend = N - 1
     return istart, iend
 
+def lc_significance_two_sided(time, flux, flux_err, frame_min, frame_max,
+                              want_baseline_pts=60, side_w=21,
+                              z_enter=2.5, z_exit=1.5, persist=2,
+                              flux_sign=+1):
+    """
+    Returns:
+      sig_max, sig_84, istart, iend, win_lo, win_hi, z, med, mad, flux
+    istart/iend are indices in (time, flux, flux_err) *after* masking (i.e., post-mfin arrays).
+    """
+    N = flux.size
+    stab = stable_mask(flux, w=side_w, z_tol=1.5)
+
+    # --- Adaptive buffer around the cluster envelope ---
+    evt_len = max(1, frame_max - frame_min + 1)
+    pad = max(10, min(500, int(0.5 * evt_len)))  # 0.5x event length, on [10, 500]
+
+    left_stop   = max(0, frame_min - pad)
+    right_start = min(N - 1, frame_max + pad)
+
+    left_mask_raw  = stab.copy();  left_mask_raw[left_stop:]   = False
+    right_mask_raw = stab.copy();  right_mask_raw[:right_start] = False
+
+    left_mask  = grow_causal(left_mask_raw,  end_idx=left_stop,   want_min=want_baseline_pts)
+    right_mask = grow_anti_causal(right_mask_raw, start_idx=right_start, want_min=want_baseline_pts, N=N)
+
+    # --- Sign-consistent baseline selection ---
+    medL = np.nanmedian(flux[left_mask])  if np.any(left_mask)  else np.nan
+    medR = np.nanmedian(flux[right_mask]) if np.any(right_mask) else np.nan
+    med_evt = np.nanmedian(flux[max(0, frame_min-pad):min(N, frame_max+pad+1)])
+
+    def _fallback():
+        return choose_lower_baseline(flux, left_mask, right_mask)
+
+    if flux_sign > 0:
+        # want event brighter than baseline
+        if np.isfinite(medL) and (med_evt > medL):
+            base_mask = left_mask
+        elif np.isfinite(medR) and (med_evt > medR):
+            base_mask = right_mask
+        else:
+            base_mask = _fallback()
+    else:
+        # want event dimmer than baseline
+        if np.isfinite(medL) and (med_evt < medL):
+            base_mask = left_mask
+        elif np.isfinite(medR) and (med_evt < medR):
+            base_mask = right_mask
+        else:
+            base_mask = _fallback()
+
+    if not np.any(base_mask):
+        base_mask = causal_baseline_mask(flux, end_idx=max(0, frame_min), min_pts=60, max_lookback=2000)
+
+    med = np.nanmedian(flux[base_mask])
+    mad = 1.4826 * np.nanmedian(np.abs(flux[base_mask] - med))
+    if not np.isfinite(mad) or mad == 0:
+        mad = np.nanstd(flux[base_mask], ddof=1)
+    if not np.isfinite(mad) or mad == 0:
+        mad = 1.0
+
+    z = (flux_sign * (flux - med)) / mad
+
+    istart, iend = find_event_window_from_z(z, z_enter=z_enter, z_exit=z_exit, persist=persist)
+    if istart is None:
+        istart, iend = max(0, frame_min), min(N-1, frame_max)
+
+    win_lo = max(0, istart)
+    win_hi = min(N, iend + 1)
+    zevt = np.abs(z[win_lo:win_hi]) if win_hi > win_lo else np.array([])
+
+    sig_max = float(np.nanmax(zevt)) if zevt.size else -1.0
+    sig_84  = float(np.nanpercentile(zevt, 84)) if zevt.size else -1.0
+
+    return sig_max, sig_84, istart, iend, z
+
 class Implement_reductions:
     def __init__(self, stars, tpf_info, diff, epsf_data, 
                  noise, corrlim=0, difflim=100, 
                  fwhmlim=5, maxlim=10, snrlim=1, roundness=0.8, 
-                 poiss_val=1, siglim=1, dist_cut=0.6, ratio_cut = 2,
+                 poiss_val=1, siglim=1, dist_cut=0.2,
                  f_dist=50):
         
         self.stars = stars
@@ -297,7 +426,6 @@ class Implement_reductions:
         self.epsf = epsf_data
         self.dist_cut = dist_cut
         self.siglim = siglim
-        self.ratio_cut = ratio_cut
         
         self.det_min_pts = 3   # Stage-1 (early) clustering len threshold
         self.val_min_pts = 5   # Stage-2 (validation) threshold
@@ -308,79 +436,19 @@ class Implement_reductions:
         self.cadence = self.time[1] - self.time[0]
         self.noise = noise
 
+        # 1) loose initial cuts
         corr = self.filter_detections(self.stars, initial=True).reset_index(drop=True)
 
+        # 2) loose grouping over *time* (frame) with f_dist ~ 50 frames by default
         groups = self._grouping(corr, f_dist=f_dist)
 
         if groups is not None and len(groups) > 0:
-            # groups = self.compute_weighted_position_stats(groups)
             full_events, filtered_stars = self.detected_events(groups, siglim=siglim)
-            # if full_events is not None:
-            #     full_events = self.downweight_overlapping_events(full_events, time_overlap_thresh=0.5)
-            #     full_events = self.filter_by_weighted_sig(full_events)
-            # else:
-            #     self.filtered_stars = None
-            #     self.full_events = None
-            
-            if full_events is not None:
-                self.filtered_stars = filtered_stars
-                self.full_events = full_events
-            else:
-                self.filtered_stars = None
-                self.full_events = None
+            self.filtered_stars = filtered_stars
+            self.full_events = full_events
         else:
             self.filtered_stars = None
             self.full_events = None
-            
-    def weighted_std(self, values, weights):
-        """
-        Weighted standard deviation
-        """
-        avg = np.sum(values * weights) / np.sum(weights)
-        variance = np.sum(weights * (values - avg)**2) / np.sum(weights)
-        return np.sqrt(variance)
-
-    def compute_weighted_position_stats(self, corr):
-        """
-        For each cluster, compute weighted x, y, xstd, ystd
-        """
-        corr = corr.copy()
-        cluster_ids = corr['cluster'].unique()
-        corr['x_weighted'] = np.nan
-        corr['y_weighted'] = np.nan
-        corr['xstd_weighted'] = np.nan
-        corr['ystd_weighted'] = np.nan
-
-        for cid in cluster_ids:
-            cluster = corr[corr['cluster'] == cid]
-            weights = cluster['snr'].values
-            xw = np.nansum(cluster['xcentroid'] * weights) / np.nansum(weights)
-            yw = np.nansum(cluster['ycentroid'] * weights) / np.nansum(weights)
-            xstd_w = self.weighted_std(cluster['xcentroid'].values, weights)
-            ystd_w = self.weighted_std(cluster['ycentroid'].values, weights)
-
-            corr.loc[cluster.index, 'x_weighted'] = xw
-            corr.loc[cluster.index, 'y_weighted'] = yw
-            corr.loc[cluster.index, 'xstd_weighted'] = xstd_w
-            corr.loc[cluster.index, 'ystd_weighted'] = ystd_w
-
-        return corr
-    
-    def filter_by_weighted_sig(self, full_events):
-        if full_events is None or len(full_events) == 0:
-            return None
-
-        mask_keep = full_events['sig_max_weighted'] > self.siglim # Keep only events above threshold
-        filtered = full_events[mask_keep].copy()
-
-        if len(filtered) == 0:
-            return None
-
-        # Re-index clusters sequentially
-        filtered = filtered.reset_index(drop=True)
-        filtered['cluster'] = np.arange(1, len(filtered) + 1)
-        
-        return filtered
         
     def filter_detections(self, stars, initial=False):
         if initial:
@@ -431,7 +499,7 @@ class Implement_reductions:
                                             'remapped_frame_min', 'remapped_frame_max', 'x', 'y', 'xstd', 'ystd', 
                                             'sig_max', 'sig_84', 'mjds', 'flux', 'flux_err',
                                             'roundness', 'fwhm', 'snr', 'psfdiff', 'correlation', 
-                                            'poisson_thresh', 'smoothness_ratio', 'e_roundness', 'e_fwhm', 'e_snr', 'e_psfdiff', 
+                                            'poisson_thresh', 'e_roundness', 'e_fwhm', 'e_snr', 'e_psfdiff', 
                                             'e_correlation', 'e_poisson_thresh'])
 
         new_stars = pd.DataFrame(columns=events.columns)
@@ -440,29 +508,17 @@ class Implement_reductions:
 
         for cid in cluster_ids:
             cluster = events[events['cluster'] == cid]
-            
-            print(f'CID: {cid}')
             if len(cluster) < self.det_min_pts:
                 continue
-            
-            print(f'PASS 1, len(cluster): {len(cluster)}')
+
             # centroid compactness (loose, pre-LC)
             x, _, xstd = sigma_clipped_stats(cluster['xcentroid'].values, sigma=3)
             y, _, ystd = sigma_clipped_stats(cluster['ycentroid'].values, sigma=3)
-            
-            # x = float(cluster['x_weighted'].iloc[0])
-            # y = float(cluster['x_weighted'].iloc[0])
-            # xstd = float(cluster['xstd_weighted'].iloc[0])
-            # ystd = float(cluster['ystd_weighted'].iloc[0])
-            
-            if (xstd >= self.dist_cut) | (ystd >= self.dist_cut):
+            if (xstd >= self.dist_cut) or (ystd >= self.dist_cut):
                 continue
 
-            print(f'PASS 2 pos_std: {xstd}, {ystd}')
             frame_min = int(cluster['frame'].min())
             frame_max = int(cluster['frame'].max())
-            
-            print(f"frame_min:{frame_min}, max: {frame_max}, x: {x:.2f}, y: {y:.2f}")
 
             # --- build LC at the centroid for this cluster ---
             bjds = deepcopy(self.time)
@@ -493,13 +549,9 @@ class Implement_reductions:
                                                   pad_frac=0.5, max_iter=3, rolling_w_for_adapt=200)
             
             istart, iend, lc_sig, med, mad, baseline_mask, err_model = args
-            
-            print(istart, iend)
 
             if istart is None:
                 continue
-            
-            print(f'PASS 3 istart not None')
 
             residual = lc_sm - med
             win_lo = max(0, istart)
@@ -509,27 +561,20 @@ class Implement_reductions:
             sig_max = float(np.nanmax(zevt)) if zevt.size else -1.0
             sig_84  = float(np.nanpercentile(zevt, 84)) if zevt.size else -1.0
 
-            if istart is not None and iend is not None and (iend - istart) >= 12:
+            if istart is not None and iend is not None and (iend - istart) >= 5:
                 sm_win = slice(istart + 2, iend + 1)
                 ratio = smoothness_metric(lc_sm[sm_win], w=21)
-            elif istart is not None and iend is not None and (iend - istart) >= self.val_min_pts:
-                ratio = 1
             else:
                 ratio = np.nan
 
             if sig_84 < siglim:
                 continue
             
-            print(f'PASS 4 SIG84: {sig_84}')
-            print(f'Ratio {ratio}')
-            
             if ~np.isfinite(ratio):
                 continue
             
-            if (ratio >= self.ratio_cut):
+            if (ratio >= 3):
                 continue
-            
-            print(f'PASS 5: {ratio}')
             
             og_ind = np.where(mfin)[0]  # original frame indices
             rmap_ind = np.arange(lc_sig.size)
@@ -538,13 +583,11 @@ class Implement_reductions:
             if len(filtered_cluster) < self.det_min_pts:
                 continue
             
-            print(f'PASS 6 len(cluster): {len(filtered_cluster)}')
-            
-            # np.save('lc_significance.npy', np.column_stack([bjds, lc_sm, lc_sm_err, lc_sig]))
-            # print('ZZZ \n', 
-            #       'ISTART & END \n', istart, iend, '\n',
-            #       'FRAME MIN & MAX \n', 
-            #       int(filtered_cluster['frame'].min()), int(filtered_cluster['frame'].max()))
+            np.save('lc_significance.npy', np.column_stack([bjds, lc_sm, lc_sm_err, lc_sig]))
+            print('ZZZ \n', 
+                  'ISTART & END \n', istart, iend, '\n',
+                  'FRAME MIN & MAX \n', 
+                  int(filtered_cluster['frame'].min()), int(filtered_cluster['frame'].max()))
 
             map_inds = np.array([np.where(og_ind == int(fr))[0][0] for fr in filtered_cluster['frame'].values])
             filtered_cluster = filtered_cluster.assign(lc_sig=lc_sig[map_inds])
@@ -575,7 +618,7 @@ class Implement_reductions:
                 x, y, xstd, ystd,
                 sig_max, sig_84,
                 t_mjd_utc, lc_sm, lc_sm_err,
-                roundness, fwhm, snr, psfdiff, correlation, poisson_thresh, ratio,
+                roundness, fwhm, snr, psfdiff, correlation, poisson_thresh,
                 e_roundness, e_fwhm, e_snr, e_psfdiff, e_correlation, e_poisson_thresh
             ]
 
@@ -584,37 +627,3 @@ class Implement_reductions:
         else:
             new_stars = new_stars.reset_index(drop=True)
             return full_events, new_stars
-
-    def downweight_overlapping_events(self, full_events, time_overlap_thresh=0.5):
-        """
-        Downweight events that overlap in time across many frames.
-        time_overlap_thresh: fraction of overlap that triggers downweight
-        """
-        if full_events is None or len(full_events) < 2:
-            full_events['overlap_factor'] = 1
-            full_events['sig_max_weighted'] = full_events['sig_max']
-            return full_events
-        
-        # Build an array of event time ranges
-        starts = full_events['remapped_frame_min'].values
-        ends   = full_events['remapped_frame_max'].values
-        n_events = len(full_events)
-        
-        overlap_factor = np.ones(n_events)  # start with no downweight
-        
-        for i in range(n_events):
-            for j in range(i+1, n_events):
-                lo = max(starts[i], starts[j])
-                hi = min(ends[i], ends[j])
-                overlap = max(0, hi - lo + 1)
-                if overlap > 0:
-                    frac_i = overlap / (ends[i] - starts[i] + 1)
-                    frac_j = overlap / (ends[j] - starts[j] + 1)
-                    if frac_i >= time_overlap_thresh or frac_j >= time_overlap_thresh:
-                        # simple downweight: e.g., reduce sig_max by factor
-                        overlap_factor[i] *= 0.5
-                        overlap_factor[j] *= 0.5
-
-        full_events['overlap_factor'] = overlap_factor
-        full_events['sig_max_weighted'] = full_events['sig_max'] * overlap_factor
-        return full_events

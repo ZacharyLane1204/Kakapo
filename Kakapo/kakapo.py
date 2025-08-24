@@ -23,13 +23,16 @@ from functools import partial
 import os
 from time import time
 
+from joblib import Parallel, delayed
 from multiprocessing import Pool, cpu_count
+from tqdm.auto import tqdm as auto_tqdm
+import threading
 
 # from Kakapo.difference_image import create_diff_image
 from Kakapo.difference_image import Difference_Imaging
 from Kakapo.selection_criteria import Implement_reductions
 from Kakapo.photometry import forced_photometry
-from Kakapo.cleaning_curve import correction_smoothing_lightcurve, wavelet_denoise
+from Kakapo.cleaning_curve import correction_smoothing_lightcurve, wavelet_denoise, gauss_smooth, binned_averages
 
 import warnings
 
@@ -376,17 +379,14 @@ def process_frame(i, diff, downsampled_array, poisson_noise, std1, std2):
             temp_star = poisson_threshold(temp_star, diff[i], poisson_noise[i])
             if temp_star is not None:
                 stars += [temp_star]
-    # else:
-    #     print(f'ZZZ None found in {i} frame')
     return stars
 
 class Kakapo():
     def __init__(self, tpf_input, epsf_data, num_cores = None, detect = True, 
-                 filtered = True, plot_diff = False, overwrite = False,
-                 savepath = './', break_point = None,
-                 mask_value=1000, tol=0.003, std1 = 3.0, std2 = 3.0, dist_cut = 0.2, 
-                 corrlim = 0.6, difflim = 0.8, fwhmlim = 2.5, maxlim = 0, snrlim = 4, 
-                 roundness = 0.35, poiss_val = 3, siglim = 2):
+                 filtered = True, overwrite = False,
+                 savepath = './', break_point = None, tol=0.003, std1 = 3.0, std2 = 3.0, 
+                 dist_cut = 0.2,  corrlim = 0.6, difflim = 0.8, fwhmlim = 2.5, ratio_cut = 1,
+                 maxlim = 0, snrlim = 4, roundness = 0.35, poiss_val = 3, siglim = 2):
         
         tpf_info = _check_tpf_type(tpf_input)
         
@@ -402,63 +402,94 @@ class Kakapo():
         num_cores = _number_cores(num_cores)
         
         if len(tpf_info) > 0:
-            jobs = [(tpf_info.iloc[i], epsf_data, std1, std2, mask_value, tol, detect, 
-                     filtered, overwrite, corrlim, difflim, fwhmlim, maxlim, snrlim, 
-                     roundness, poiss_val, siglim, plot_diff, dist_cut, savepath) 
+            jobs = [(tpf_info.iloc[i], epsf_data, std1, std2, tol, detect, 
+                     filtered, overwrite, ratio_cut, corrlim, difflim, fwhmlim, 
+                     maxlim, snrlim, roundness, poiss_val, siglim, dist_cut, savepath) 
                     for i in range(len(tpf_info))]
             
-            with Pool(processes=num_cores) as pool: # Use multiprocessing pool to parallelise the process
-                results = list(tqdm(pool.imap(self._process_tpf, jobs), total=len(jobs), desc='TPFs'))
+            # with Pool(processes=num_cores) as pool: # Use multiprocessing pool to parallelise the process
+            #     results = list(tqdm(pool.imap(self._process_tpf, jobs), total=len(jobs), desc='TPFs'))
+            
+            # def _process_wrapper(job):          # wrapper so tqdm shows thread progress
+            #     return self._process_tpf(job)
+
+            # # run:
+            # with Parallel(n_jobs=num_cores, backend="threading") as parallel:
+            #     results = list(tqdm(
+            #         parallel(delayed(_process_wrapper)(job) for job in jobs),
+            #         total=len(jobs), desc="TPFs (threads)"
+            #     ))
+            
+            lock = threading.Lock()
+            progress_bar = auto_tqdm(total=len(jobs), desc="TPFs (threads)", position=0)
+
+            def _process_wrapper(job):
+                result = self._process_tpf(job)
+                with lock:
+                    progress_bar.update(1)
+                return result
+
+            # Run in parallel
+            results = Parallel(n_jobs=num_cores, backend="loky")(
+                delayed(_process_wrapper)(job) for job in jobs
+            )
+
+            progress_bar.close()
+
                 
         else:
             if tpf_info['mission'].iloc[0] == 'Kepler':
-                name = 'diff_q{}_t{}'.format(tpf_info['campaign'].iloc[0], tpf_info['targetid'].iloc[0])
+                diff_name = f"diff_q{tpf_info['campaign'].iloc[0]}_t{tpf_info['targetid'].iloc[0]}.npy"
+                noise_name = f"noise_q{tpf_info['campaign'].iloc[0]}_t{tpf_info['targetid'].iloc[0]}.npy"
+                star_name = f"q{tpf_info['campaign'].iloc[0]}_t{tpf_info['targetid'].iloc[0]}.csv"
                 mission = 'Kepler'
             else:
-                name = 'diff_c{}_t{}'.format(tpf_info['campaign'].iloc[0], tpf_info['targetid'].iloc[0])
+                diff_name = f"diff_c{tpf_info['campaign'].iloc[0]}_t{tpf_info['targetid'].iloc[0]}.npy"
+                noise_name = f"noise_c{tpf_info['campaign'].iloc[0]}_t{tpf_info['targetid'].iloc[0]}.npy"
+                star_name = f"c{tpf_info['campaign'].iloc[0]}_t{tpf_info['targetid'].iloc[0]}.csv"
                 mission = 'K2'
             
             os.makedirs(savepath + f'difference_arrays/c{tpf_info["campaign"].iloc[0]}/', exist_ok = True)
             
-            full_file_name = savepath + f'difference_arrays/c{tpf_info["campaign"].iloc[0]}/' + name
+            full_file_name = savepath + f'difference_arrays/c{tpf_info["campaign"].iloc[0]}/' + diff_name
+            noise_file_name = savepath + f'noise_arrays/c{tpf_info["campaign"].iloc[0]}/' + noise_name
+            star_file_name = savepath + f'csv_files/c{tpf_info["campaign"].iloc[0]}/' + star_name
             
             if os.path.exists(full_file_name) & (overwrite == False):
-                pass
+                diff = np.load(full_file_name)
+                noise = np.load(noise_file_name)
+                try:
+                    stars = pd.read_csv(star_file_name)
+                except:
+                    stars = None
             else:
-                
-                diff, stars, reset_indices, distances = self.run(tpf_info.iloc[0], self.epsf, 
-                                                                mask_value = mask_value, tol = tol, 
-                                                                detect = detect, overwrite = overwrite, 
-                                                                plot_diff = plot_diff)
-                
-                
+                diff, stars, noise = self.run(tpf_info.iloc[0], self.epsf, tol = tol, 
+                                              detect = detect, overwrite = overwrite, savepath = savepath)
 
                 np.save(full_file_name, diff)
+                np.save(noise_file_name, noise)
                 
-                if filtered & (stars is not None):
-                    self._filter_and_save_stars(stars, tpf_info.iloc[0], diff, corrlim, difflim, fwhmlim,
-                                                maxlim, snrlim, roundness, poiss_val, siglim, dist_cut, 
-                                                savepath, reset_indices, epsf_data, distances)
+            if filtered & (stars is not None):
+                self._filter_and_save_stars(stars, tpf_info.iloc[0], diff, noise, corrlim, difflim, fwhmlim,
+                                            maxlim, snrlim, roundness, poiss_val, siglim, dist_cut, ratio_cut,
+                                            savepath, epsf_data)
             
-    def _run_object(self, tpf_info, epsf, std1=3.0, std2=3.0, plot=False, mask_value=1000, tol=0.003, 
-                   detect = True, overwrite = False, full_file_name = 'test.csv', savepath = './'):
+    def _run_object(self, tpf_info, epsf, std1=3.0, std2=3.0, tol=0.2, detect = True, 
+                    overwrite = False, full_file_name = 'test.csv', savepath = './'):
         
         # args = create_diff_image(tpf_info, epsf, plot = plot, tol=tol)
         # ref, diff, poisson_noise, ref_frame_idx, reset_indices, distances = args
         
-        chunky_bird = Difference_Imaging(tpf_info, epsf, tol=0.2)
+        chunky_bird = Difference_Imaging(tpf_info, epsf, tol=tol)
 
         ref = chunky_bird.ref
-        poisson_noise = chunky_bird.noise
+        poisson_noise = chunky_bird.diff_noise
         diff = chunky_bird.diffs
-        reset_indices = chunky_bird.thrusters
-        distances = chunky_bird.distance
         ref_frame_idx = chunky_bird.ref_frame
         
         # print(np.sum(np.isnan(diff)), np.count_nonzero(diff))
-        
-        
-        # print('ZZZ DIFF IM')
+        campaign = tpf_info['campaign']
+        targetid = tpf_info['targetid']
         
         if ref is None:
             # print('Na ah!!!')
@@ -471,8 +502,9 @@ class Kakapo():
         ra = tpf_info['ra']
         dec = tpf_info['dec']
         
+        full_file_name = savepath + f'csv_files/c{campaign}/c{campaign}_t{targetid}.csv'    
+        
         if detect:
-            # print('ZZZ Detection')
             stars = self.detection(diff, epsf, poisson_noise, ref_value, 
                                    std1 = std1, std2 = std2)
             if stars is not None:
@@ -489,33 +521,46 @@ class Kakapo():
         else:
             stars = None
         
-        return diff, stars, reset_indices, distances
+        return diff, stars, poisson_noise
     
     def _process_tpf(self, args):
-        tpf_info_row, epsf_data, std1, std2, mask_value, tol, detect, filtered, overwrite, \
-        corrlim, difflim, fwhmlim, maxlim, snrlim, roundness, poiss_val, siglim, plot_diff, dist_cut, savepath = args
+        tpf_info_row, epsf_data, std1, std2, tol, detect, filtered, overwrite, ratio_cut, \
+        corrlim, difflim, fwhmlim, maxlim, snrlim, roundness, poiss_val, siglim, dist_cut, savepath = args
 
         # start = time()
         # print(f'ZZZ Pre-run: c{tpf_info_row.campaign} t{tpf_info_row.targetid}')
-        diff, stars, reset_indices, distances = self.run(tpf_info_row, epsf_data, std1=std1, std2=std2, 
-                                                         mask_value=mask_value, tol=tol, detect=detect, 
-                                                         overwrite=overwrite, plot_diff = plot_diff)
-        # print(f'ZZZ Post-run: c{tpf_info_row.campaign} t{tpf_info_row.targetid} {(time() - start)/60:.2f}')
-        if diff is None:
-            print('Fail')
-            pass
+        
+        diff_name = f"diff_c{tpf_info_row['campaign']}_t{tpf_info_row['targetid']}.npy"
+        noise_name = f"noise_c{tpf_info_row['campaign']}_t{tpf_info_row['targetid']}.npy"
+        star_name = f"c{tpf_info_row['campaign']}_t{tpf_info_row['targetid']}.csv"
+        
+        full_file_name = savepath + f'difference_arrays/c{tpf_info_row["campaign"]}/' + diff_name
+        noise_file_name = savepath + f'noise_arrays/c{tpf_info_row["campaign"]}/' + noise_name
+        star_file_name = savepath + f'csv_files/c{tpf_info_row["campaign"]}/' + star_name
+        
+        os.makedirs(savepath + f'difference_arrays/c{tpf_info_row["campaign"]}/', exist_ok = True)
+        os.makedirs(savepath + f'noise_arrays/c{tpf_info_row["campaign"]}/', exist_ok = True)
+        os.makedirs(savepath + f'csv_files/c{tpf_info_row["campaign"]}/', exist_ok = True)
+            
+        if os.path.exists(star_file_name) & (overwrite == False):
+            diff = np.load(full_file_name)
+            noise = np.load(noise_file_name)
+            try:
+                stars = pd.read_csv(star_file_name)
+            except:
+                stars = None
         else:
-            name = 'diff_c{}_t{}'.format(tpf_info_row['campaign'], tpf_info_row['targetid'])
-            
-            os.makedirs(savepath + f'difference_arrays/c{tpf_info_row["campaign"]}/', exist_ok = True)
-            
-            full_file_name = savepath + f'difference_arrays/c{tpf_info_row["campaign"]}/' + name
+        
+            diff, stars, noise = self.run(tpf_info_row, epsf_data, std1=std1, std2=std2, 
+                                        tol=tol, detect=detect, overwrite=overwrite, savepath = savepath)
+        # print(f'ZZZ Post-run: c{tpf_info_row.campaign} t{tpf_info_row.targetid} {(time() - start)/60:.2f}')
             np.save(full_file_name, diff)
+            np.save(noise_file_name, noise)    
             
-            if filtered & (stars is not None):
-                self._filter_and_save_stars(stars, tpf_info_row, diff, corrlim, difflim, fwhmlim,
-                                            maxlim, snrlim, roundness, poiss_val, siglim, dist_cut, 
-                                            savepath, reset_indices, epsf_data, distances)
+        if filtered & (stars is not None):
+            self._filter_and_save_stars(stars, tpf_info_row, diff, noise, corrlim, difflim, fwhmlim,
+                                        maxlim, snrlim, roundness, poiss_val, siglim, dist_cut, ratio_cut,
+                                        savepath, epsf_data)
                
     def detection(self, diff, epsf, poisson_noise, ref_value, std1=3.0, std2=3.0):
 
@@ -523,7 +568,6 @@ class Kakapo():
 
         for i in range(len(diff)):
             temp_stars = process_frame(i, diff, epsf, poisson_noise, std1, std2)
-            # print('ZZZ temp_stars', temp_stars)
             
             if temp_stars: # Check if temp_stars is not empty (i.e., contains DataFrames)
                 stars.extend(temp_stars)  # Append all elements of temp_stars to stars
@@ -568,37 +612,18 @@ class Kakapo():
         
         stars.to_csv(full_file_name, index=False)
         
-    def run(self, tpf_info, epsf, std1 = 3, std2 = 3, mask_value = 1000, tol = 0.003, 
-            detect = True, overwrite = False, plot_diff = False, savepath = './'):
+    def run(self, tpf_info, epsf, std1 = 3, std2 = 3, tol = 0.2, 
+            detect = True, overwrite = False, savepath = './', full_file_name = None):
         
-        campaign = tpf_info['campaign']
-        targetid = tpf_info['targetid']
+        args = self._run_object(tpf_info, epsf, std1 = std1, std2 = std2, tol=tol, detect = detect,
+                                overwrite = overwrite, full_file_name = full_file_name, savepath=savepath)
         
-        name = 'c{}_t{}.csv'.format(campaign, targetid)
-        full_file_name = savepath + f'Data/csv_files/c{campaign}/' + name
-        
-        os.makedirs(savepath + f'Data/csv_files/c{campaign}/', exist_ok = True)
+        diff, stars, noise = args
+        return diff, stars, noise
 
-        
-        if os.path.exists(full_file_name) & (overwrite == False):
-            self.stars = pd.read_csv(full_file_name)
-            
-            args = self._run_object(tpf_info, epsf, plot=plot_diff, mask_value=mask_value, 
-                                    tol=tol, detect = False, full_file_name = full_file_name, 
-                                    savepath=savepath)
-            
-        else:
-        
-            args = self._run_object(tpf_info, epsf, std1 = std1, std2 = std2, plot=plot_diff, 
-                                    mask_value=mask_value, tol=tol, detect = detect,
-                                    overwrite = overwrite, full_file_name = full_file_name, savepath=savepath)
-        
-        diff, stars, reset_indices, distances = args
-        return diff, stars, reset_indices, distances
-
-    def _filter_and_save_stars(self, stars, tpf_info, diff, corrlim, difflim, fwhmlim, 
-                                maxlim, snrlim, roundness, poiss_val, siglim, dist_cut, 
-                                savepath, reset_indices, epsf_data, distances):
+    def _filter_and_save_stars(self, stars, tpf_info, diff, noise, corrlim, difflim, fwhmlim, 
+                                maxlim, snrlim, roundness, poiss_val, siglim, dist_cut, ratio_cut,
+                                savepath, epsf_data):
         """
         Handle filtering and saving of star data to CSV after processing.
         """
@@ -608,22 +633,12 @@ class Kakapo():
         mission = tpf_info['mission']
         ra = tpf_info['ra']
         dec = tpf_info['dec']
-        bjds = tpf_info['time'].value + 54832.5
         
-        time_mask = tpf_info['time'].value <= 40
-        
-        # pos_corr1 = tpf_info['pos_corr1']
-        # pos_corr2 = tpf_info['pos_corr2']
-        start = time()
-        # print(f'ZZZ Pre-reductions: c{tpf_info.campaign} t{tpf_info.targetid}')
-        
-        impred = Implement_reductions(stars, tpf_info, diff, epsf_data, reset_indices, distances, 
+        impred = Implement_reductions(stars, tpf_info, diff, epsf_data, noise,
                                       corrlim=corrlim, difflim=difflim, 
                                       fwhmlim=fwhmlim, maxlim=maxlim, snrlim=snrlim, 
                                       roundness=roundness, poiss_val=poiss_val, 
-                                      siglim=siglim, dist_cut=dist_cut)
-
-        # print(f'ZZZ Post-reductions: c{tpf_info.campaign} t{tpf_info.targetid} {(time() - start)/60:.2f}')
+                                      siglim=siglim, dist_cut=dist_cut, ratio_cut=ratio_cut)
 
         filtered_stars = impred.filtered_stars
         full_events = impred.full_events
@@ -653,20 +668,26 @@ class Kakapo():
             full_events.to_csv(full_events_file_name, index=False)
             
             for i in range(len(full_events)):
+                mjds = np.array(full_events['mjds'].iloc[i])
+                fluxes = np.array(full_events['flux'].iloc[i])
+                flux_err = np.array(full_events['flux_err'].iloc[i])
+                
                 cluster_number = int(full_events['cluster'].iloc[i])
                 x = full_events['x'].iloc[i]
                 y = full_events['y'].iloc[i]
-                frame_min = int(full_events['frame_min'].iloc[i])
-                frame_max = int(full_events['frame_max'].iloc[i])
+                frame_min = int(full_events['remapped_frame_min'].iloc[i])
+                frame_max = int(full_events['remapped_frame_max'].iloc[i])
+                
+                true_start = full_events['true_start'].iloc[i]
+                true_end = full_events['true_end'].iloc[i]
+                
                 if mission == 'Kepler':
                     figures_name = f'figures_q{campaign}_t{targetid}_e{cluster_number}.png'
                 elif mission == 'K2':
                     figures_name = f'figures_c{campaign}_t{targetid}_e{cluster_number}.png'
                 figures_file_name = os.path.abspath(f'{savepath}figures/c{campaign}/{figures_name}')
                 
-                fluxes = forced_photometry(diff, x, y, epsf_data)
-                fluxes = correction_smoothing_lightcurve(fluxes, distances < 0.25, window=35, sigma=3)
-                fluxes = wavelet_denoise(fluxes, wavelet='coif5', level=3, keep='low', mode = 'smooth')
+                b_time, b_flux, b_flux_err = binned_averages(mjds, fluxes, flux_err, bin_size = 3)
                 
                 len_frames = (frame_max - frame_min)/2
                 if len_frames < 50:
@@ -689,25 +710,25 @@ class Kakapo():
                 plt.subplots_adjust(hspace=0.13)
 
                 for i in range(2):
-                    axs[i].fill_betweenx([min_lim, max_lim], bjds[frame_min], bjds[frame_max], color='C1', alpha = 0.5)
+                    # axs[i].fill_betweenx([min_lim, max_lim], mjds[frame_min], mjds[frame_max], color='C1', alpha = 0.5)
+                    axs[i].fill_betweenx([min_lim, max_lim], true_start, true_end, color='C1', alpha = 0.5)
                     axs[i].set_ylabel('Counts')
                     
-                axs[0].plot(bjds[np.isfinite(fluxes)], fluxes[np.isfinite(fluxes)], color = 'k')
-                axs[1].plot(bjds[np.isfinite(fluxes)], fluxes[np.isfinite(fluxes)], color = 'k')
+                axs[0].scatter(mjds[np.isfinite(fluxes)], fluxes[np.isfinite(fluxes)], s = 20, color = 'k', alpha = 0.3)
+                axs[0].scatter(b_time, b_flux, color = 'cyan', edgecolor='grey', s = 6, linewidth=0.3, alpha = 1)
+                axs[1].scatter(mjds[np.isfinite(fluxes)], fluxes[np.isfinite(fluxes)], s = 20, color = 'k', alpha = 0.3)
+                axs[1].scatter(b_time, b_flux, color = 'cyan', edgecolor='grey', s = 6, linewidth=0.3, alpha = 1)
                 
-                axs[0].set_xlim(bjds[int(np.floor(plot_frame_min))], bjds[int(np.floor(plot_frame_max))])
+                axs[0].set_xlim(mjds[int(np.floor(plot_frame_min))], mjds[int(np.floor(plot_frame_max))])
                 axs[0].set_ylim(min_lim, max_lim)
                 axs[0].set_title('Forced Photometry')
                 
-                axs[1].set_xlabel('Time (BMJD)')
+                axs[1].set_xlabel('Time (MJD)')
                 
-                # axs[0].set_ylim(p_min_lim, p_max_lim)
-                # axs[0].set_xlim(plot_frame_min, plot_frame_max)
+                unique, counts = np.unique(mjds, return_counts=True)
+                mjds_temp = unique[counts == 1]
                 
-                unique, counts = np.unique(bjds, return_counts=True)
-                bjds_temp = unique[counts == 1]
-                
-                axs[1].set_xlim(min(bjds_temp), max(bjds_temp))
+                axs[1].set_xlim(min(mjds_temp), max(mjds_temp))
                 axs[1].set_ylim(min_lim, max_lim)
                 
                 if mission == 'Kepler':
@@ -716,9 +737,9 @@ class Kakapo():
                     axs[0].set_title(f'c{campaign} t{targetid} e{cluster_number}')
 
                 
-                axs[1].text((max(bjds_temp) - min(bjds_temp))/10 + min(bjds_temp), 
+                axs[1].text((max(mjds_temp) - min(mjds_temp))/10 + min(mjds_temp), 
                             max_lim / 1.1, f'Frame: {frame_min}--{frame_max}, x: {x:.2f}, y: {y:.2f}')
-                # axs[1].text(bjds[int(np.floor(plot_frame_min))] + 100, np.nanmax(fluxes), f'Frame: {frame_min}--{frame_max}, x: {x:.2f}, y: {y:.2f}')
+                # axs[1].text(mjds[int(np.floor(plot_frame_min))] + 100, np.nanmax(fluxes), f'Frame: {frame_min}--{frame_max}, x: {x:.2f}, y: {y:.2f}')
                 
                 plt.savefig(figures_file_name, dpi = 800, bbox_inches='tight')
                 plt.close()

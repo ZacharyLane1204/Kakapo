@@ -33,7 +33,7 @@ from multiprocessing import Pool, cpu_count
 from Kakapo.difference_image import create_diff_image_de
 from Kakapo.build_epsf import epsf_data_creation
 from diagnostic_plots import diagnostic_plotting
-from Kakapo.selection_criteria import Implement_reductions
+from Kakapo.selection_criteria_iter2 import Implement_reductions
 
 import warnings
 # from astropy.utils.exceptions import AstropyUserWarning
