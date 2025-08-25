@@ -19,6 +19,7 @@ import george
 from george import kernels
 
 from astropy.stats import sigma_clipped_stats
+from astropy.timeseries import LombScargle
 
 # import celerite2
 # from celerite2 import GaussianProcess
@@ -26,6 +27,30 @@ from astropy.stats import sigma_clipped_stats
 # from celerite2.terms import SHOTerm, RealTerm
 
 import matplotlib.pyplot as plt
+
+def check_periodicity(times, flux=None, flux_err=None, fap_level=0.025):
+    """
+    Quick periodicity check. Returns (bool, period, confidence).
+    - If flux provided, uses LC.
+    - Otherwise, treats times as delta events.
+    """
+    if len(times) < 3:
+        return False, np.nan, 0.0
+
+    y = flux if flux is not None else np.ones_like(times)
+    dy = flux_err if flux_err is not None else None
+
+    ls = LombScargle(times, y, dy)
+    freq, power = ls.autopower()
+    best_freq = freq[np.argmax(power)]
+    best_period = 1.0 / best_freq
+
+    # Confidence = 1 - FAP (False Alarm Probability)
+    fap = ls.false_alarm_probability(power.max())
+    confidence = 1 - fap
+    is_periodic = fap < fap_level
+
+    return is_periodic, best_period, confidence
 
 def median_clip(data, sigma=3):
     med = np.nanmedian(data)
@@ -414,7 +439,7 @@ def flatten_and_mask_outliers(flux, mask=None, gp_kernel=None, gp_scale=11, outl
 def gauss_smooth(time, flux, flux_error=None, n_samples=11):
     kernel = (C(0.1) * RBF(length_scale=3.0) +
               C(1e-4, (5e-5, 5e-3)) * RBF(length_scale=0.25, length_scale_bounds=(0.05, 0.5)) +
-              WhiteKernel(noise_level=1e-2))
+              WhiteKernel(noise_level=3e-3))
 
     base_alpha_values = [0.05, 0.15, 0.25]
     weights_norm = 1
@@ -424,7 +449,7 @@ def gauss_smooth(time, flux, flux_error=None, n_samples=11):
             
             alpha_per_point = (base_alpha / weights_norm) ** 2
             if flux_error is not None:
-                max_var = np.nanpercentile(flux_error**2, 95)  # or a fixed ceiling
+                # max_var = np.nanpercentile(flux_error**2, 95)  # or a fixed ceiling
                 # alpha = np.minimum(flux_error**2, max_var) + alpha_per_point
                 alpha = (flux_error**2) + alpha_per_point
             else:

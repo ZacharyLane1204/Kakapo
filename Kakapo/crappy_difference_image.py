@@ -52,11 +52,11 @@ class Crappy_Difference_Imaging():
         for idx in mask:
             f = np.copy(self.flux[idx])
             d_f = np.copy(self.flux_err[idx])
-            dx, dy = self.pos_corr1[idx], self.pos_corr2[idx]
-            f_shifted = self._shift_fourier(f, -dx, -dy)  # shift to reference frame
-            df_shifted = self._shift_fourier(d_f, -dx, -dy)  # shift to reference frame
-            shifted_stack.append(f_shifted)
-            noise_stack.append(df_shifted)
+            # dx, dy = self.pos_corr1[idx], self.pos_corr2[idx]
+            # f_shifted = self._shift_fourier(f, -dx, -dy)  # shift to reference frame
+            # df_shifted = self._shift_fourier(d_f, -dx, -dy)  # shift to reference frame
+            shifted_stack.append(f)
+            noise_stack.append(d_f)
 
         shifted_stack = np.array(shifted_stack)
         noise_stack = np.array(noise_stack)
@@ -75,15 +75,15 @@ class Crappy_Difference_Imaging():
     def compute_difference_images_with_psf(self):
         diff_images = []
         diff_noises = []
-        alphas = []
+        # alphas = []
         for i in range(len(self.flux)):
             if np.isnan(self.flux[i]).sum() >= self.flux[i].shape[0] * self.flux[i].shape[1] *  0.7:
                 diff_images.append(np.nan*np.ones_like(self.flux[0]))
                 diff_noises.append(np.nan*np.ones_like(self.flux[0]))
-                alphas.append(np.nan)
+                # alphas.append(np.nan)
                 continue
             
-            shifted = self._shift_fourier(self.flux[i], -self.pos_corr1[i], -self.pos_corr2[i])
+            shifted = self.flux[i].copy() #self._shift_fourier(self.flux[i], -self.pos_corr1[i], -self.pos_corr2[i])
         
             alpha = 1
             

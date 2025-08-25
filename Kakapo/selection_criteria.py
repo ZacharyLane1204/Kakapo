@@ -1,6 +1,6 @@
 from Kakapo.photometry import forced_photometry, forced_photometry_psf
 # from Kakapo.difference_image im
-from Kakapo.cleaning_curve import correction_smoothing_lightcurve, wavelet_denoise, gauss_smooth, binned_averages
+from Kakapo.cleaning_curve import check_periodicity, gauss_smooth
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,6 +8,8 @@ import pandas as pd
 
 from astropy.stats import sigma_clipped_stats
 from astropy.stats import bayesian_blocks
+from astropy.stats import sigma_clip
+
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 
@@ -140,7 +142,8 @@ def iterative_baseline_zscore_fast(time,
 
     for it in range(max_iter):
         evt_len = max(1, prev_iend - prev_istart + 1)
-        pad = int(max(10, min(500, pad_frac * evt_len)))
+        
+        pad = int(max(10, min(int(0.1 * N), pad_frac * evt_len)))
         mask_transient = np.zeros(N, bool)
         mask_transient[max(0, prev_istart - pad): min(N, prev_iend + pad + 1)] = True
         baseline_mask = (~mask_transient) & finite
@@ -166,11 +169,19 @@ def iterative_baseline_zscore_fast(time,
 
         new_istart, new_iend = find_event_window_from_z(z, z_enter=z_enter, z_exit=z_exit, persist=persist)
         if new_istart is None: # if nothing new, keep previous
-            break # convergence check (allow tiny shifts)
-        if (new_istart == prev_istart) and (new_iend == prev_iend):
-            prev_istart, prev_iend = new_istart, new_iend
             break
-        prev_istart, prev_iend = new_istart, new_iend
+
+        if frame_min is not None and frame_max is not None:
+            if not (new_iend < frame_min or new_istart > frame_max): # require overlap with seed window
+                prev_istart, prev_iend = new_istart, new_iend
+            else:
+                prev_istart, prev_iend = frame_min, frame_max # reject: stick with original seed window
+                break
+        else:
+            if (new_istart == prev_istart) and (new_iend == prev_iend):
+                prev_istart, prev_iend = new_istart, new_iend
+                break
+            prev_istart, prev_iend = new_istart, new_iend
 
     evt_len = max(1, prev_iend - prev_istart + 1) # final baseline mask and error model
     pad = int(max(10, min(500, pad_frac * evt_len)))
@@ -209,14 +220,6 @@ def causal_baseline_mask(lc, end_idx, min_pts=48, max_lookback=500):
     mask[end_idx:] = False # strictly causal (exclude end_idx and after)
     return mask
 
-def rolling_median_mad(x, w):
-    # Utility: rolling median + MAD (replace sigma clipping)
-    s = pd.Series(x)
-    med = s.rolling(w, min_periods=w//2).median()
-    mad = (s - med).abs().rolling(w, min_periods=w//2).median()
-    mad = 1.4826 * mad
-    return med.to_numpy(), mad.to_numpy()
-
 def stable_mask(x, w=21, z_tol=1.5):
     """
     Flag "stable" samples where rolling z is small (quasi-flat).
@@ -245,15 +248,15 @@ def choose_lower_baseline(f, left_mask, right_mask):
     else:
         return np.zeros_like(f, dtype=bool)  # no baseline found
 
-def find_event_window_from_z(z, z_enter=2.5, z_exit=1.0, persist=2):
+def find_event_window_from_z(z, z_enter=2.5, z_exit=1.0, persist=2, exit_frac=0.5):
     """
     Hysteretic onset/end from Z with persistence.
     - enter when z > z_enter for persist samples
-    - exit when z < z_exit after being inside
-    Returns (i_start, i_end). If no event, returns (None, None).
+    - exit when at least `exit_frac` of last `persist` samples are < z_exit
     """
     N = z.size
     above = z > z_enter
+
     # persistence enter
     run = 0
     istart = None
@@ -265,17 +268,14 @@ def find_event_window_from_z(z, z_enter=2.5, z_exit=1.0, persist=2):
     if istart is None:
         return None, None
 
-    # exit hysteresis
-    iend = None
-    inside = True
+    # exit condition with fraction-based rule
+    iend = N - 1
     for j in range(istart, N):
-        if z[j] < z_exit:
-            # require a couple below to avoid chattering
-            if j+1 < N and z[j+1] < z_exit:
-                iend = j+1
-                break
-    if iend is None:
-        iend = N - 1
+        window = z[j:j+persist]
+        if window.size == persist and np.nanmean(window < z_exit) >= exit_frac:
+            iend = j + persist - 1
+            break
+
     return istart, iend
 
 class Implement_reductions:
@@ -313,24 +313,32 @@ class Implement_reductions:
         groups = self._grouping(corr, f_dist=f_dist)
 
         if groups is not None and len(groups) > 0:
-            # groups = self.compute_weighted_position_stats(groups)
-            full_events, filtered_stars = self.detected_events(groups, siglim=siglim)
-            # if full_events is not None:
-            #     full_events = self.downweight_overlapping_events(full_events, time_overlap_thresh=0.5)
-            #     full_events = self.filter_by_weighted_sig(full_events)
-            # else:
-            #     self.filtered_stars = None
-            #     self.full_events = None
+            processor = EventProcessor(time_overlap_thresh=0.6)
+
+            filtered_events, surviving_groups = processor.filter_detections_by_clusters(groups)
+            if surviving_groups is not None:
+                args = self.detected_events(groups, siglim=siglim)
+                full_events, filtered_events, lc_mjds_arr, lc_flux_arr, lc_flux_err_arr = args
             
-            if full_events is not None:
-                self.filtered_stars = filtered_stars
-                self.full_events = full_events
+                if full_events is not None:
+                    self.filtered_stars = filtered_events
+                    self.full_events = full_events
+                    self.lc_mjds_arr = lc_mjds_arr
+                    self.lc_flux_arr = lc_flux_arr
+                    self.lc_flux_err_arr = lc_flux_err_arr
+                else:
+                    self._build_Nones()
             else:
-                self.filtered_stars = None
-                self.full_events = None
+                self._build_Nones()
         else:
-            self.filtered_stars = None
-            self.full_events = None
+            self._build_Nones()
+            
+    def _build_Nones(self):
+        self.filtered_stars = None
+        self.full_events = None
+        self.lc_mjds_arr = None
+        self.lc_flux_arr = None
+        self.lc_flux_err_arr = None
             
     def weighted_std(self, values, weights):
         """
@@ -387,7 +395,7 @@ class Implement_reductions:
             corr = stars[(stars.correlation >= 0.01) & 
                          (stars.psfdiff <= 2) & 
                          (stars.fwhm <= 8) &  (stars.fwhm >= 0.8) & 
-                         (stars.snr >= 4) & (stars.snr < 10000) & 
+                         (stars.snr >= 1) & (stars.snr < 10000) & 
                          (abs(stars.roundness) <= 0.99) & 
                          (stars.poisson_thresh >= 1)]
         else:
@@ -400,38 +408,174 @@ class Implement_reductions:
         return corr
     
     def mask_detections(self, correlation, psfdiff, fwhm, snr, 
-                        roundness, poisson_thresh, xstd, ystd):
+                        roundness, poisson_thresh, xstd, ystd, lc_snr):
+        
         return ((correlation >= self.corrlim) & (psfdiff <= self.difflim) &
                 (fwhm <= self.fwhmlim) & (fwhm >= 0.8) &
-                (snr >= self.snrlim) & (snr < 10000) & (abs(roundness) <= self.roundness) &
+                (abs(snr) >= self.snrlim) & (abs(snr) < 10000) & 
+                (abs(roundness) <= self.roundness) &
                 (poisson_thresh >= self.poiss_val) &
-                (xstd <= self.dist_cut) & (ystd <= self.dist_cut))
+                (xstd <= self.dist_cut) & (ystd <= self.dist_cut) & 
+                (abs(lc_snr) >= self.snrlim))
         
-    def _grouping(self, corr: pd.DataFrame, f_dist: int = 50) -> pd.DataFrame | None:
+    def _estimate_frame_scale(self, corr, r_xy=0.75, q=0.8, min_pairs=50, default_scale=50):
+        """
+        Estimate a typical 'association' time scale (in frames) from local (x,y) neighbors.
+        Looks at |Δframe| among points within r_xy pixels and returns the q-quantile.
+        Falls back to default_scale if not enough pairs.
+        """
+        if len(corr) < 2:
+            return default_scale
+
+        pts = corr[['xcentroid','ycentroid']].to_numpy(np.float32)
+        frames = corr['frame'].to_numpy(np.int64)
+        tree = cKDTree(pts)
+        idx_lists = tree.query_ball_point(pts, r=r_xy)
+
+        dts = []
+        for i, neigh in enumerate(idx_lists):
+            fi = frames[i]
+            for j in neigh:
+                if j == i: 
+                    continue
+                dts.append(abs(fi - frames[j]))
+
+        if len(dts) >= min_pairs:
+            return max(5, np.nanpercentile(dts, q*100.0))
+        return default_scale
+    
+    def _grouping(self, corr: pd.DataFrame, f_dist: int = 50, micro_pixel_tol: float = 0.3) -> pd.DataFrame | None:
+        """
+        Stage A: reproduce your 3D DBSCAN on [x,y,frame] to get 'big' clusters.
+        Stage B: inside each big cluster, find micro-splinters (min_samples=1) in (x,y),
+                pick the best splinter by weight = sqrt(N)*sqrt(sum(snr)),
+                and attach sigma-clipped, SNR-weighted position stats.
+        Returns a 'refined' corr containing ONLY the winning splinter rows per big cluster,
+        with new per-row columns:
+        x_weight, y_weight, x_weight_std, y_weight_std, int_SNR, frame_min, frame_max
+        and a re-numbered 'cluster' (1..K) for downstream use.
+        """
         if corr.empty:
             return None
-        data = corr[['xcentroid', 'ycentroid', 'frame']].values.astype(np.float32)
-        data[:, 2] *= 1.5 / f_dist  # makes eps=1.5 span roughly ±f_dist frames
 
-        db = DBSCAN(eps=1.5,
-                    min_samples=self.det_min_pts,
-                    metric='euclidean',
-                    algorithm='auto',
-                    n_jobs=1)
+        # ---------- Stage A: your spatiotemporal DBSCAN (with adaptive frame scaling) ----------
+        f_scale = self._estimate_frame_scale(corr, r_xy=0.75, q=0.8, min_pairs=50, default_scale=f_dist)
+        
+        f_scale = max(f_scale, f_dist)
+
+        data = corr[['xcentroid', 'ycentroid', 'frame']].to_numpy(np.float32)
+        data[:, 2] *= 1.5 / float(f_scale)
+
+        db = DBSCAN(
+            eps=1.5,
+            min_samples=self.det_min_pts,     # your original seed requirement (e.g., 3)
+            metric='euclidean',
+            algorithm='auto',
+            n_jobs=1
+        )
         labels = db.fit_predict(data)
-        corr = corr.assign(cluster=labels)
-        corr = corr[corr.cluster != -1]
-        return corr if not corr.empty else None
+        corrA = corr.assign(cluster_big=labels)
+        corrA = corrA[corrA.cluster_big != -1]
+        if corrA.empty:
+            return None
+
+        # ---------- Stage B: refine each big cluster by spatial micro-splinters ----------
+        refined_rows = []
+        new_cluster_id = 1
+
+        for big_id, sub in corrA.groupby('cluster_big'):
+            xy = sub[['xcentroid', 'ycentroid']].to_numpy(np.float64) # Tight spatial-only DBSCAN inside this big cluster to get splinters
+            micro_labels = DBSCAN(
+                eps=micro_pixel_tol,
+                min_samples=1,                # catch even singletons
+                metric='euclidean',
+                algorithm='auto',
+                n_jobs=1
+            ).fit_predict(xy)
+            sub = sub.assign(micro=micro_labels)
+
+            best = None # Evaluate each micro-splinter; choose the best by weight = sqrt(N)*sqrt(sum(snr))
+            best_payload = None
+
+            for mid, g in sub.groupby('micro'):
+                N = len(g)
+                snr = g['snr'].to_numpy(float)
+                snr_sum = float(np.nansum(snr))
+                weight_for_selection = np.sqrt(max(N, 1)) * np.sqrt(max(snr_sum, 1e-12))
+
+                x_raw = g['xcentroid'].to_numpy(float) # Sigma-clip x/y, then compute SNR-weighted mean and std within this micro
+                y_raw = g['ycentroid'].to_numpy(float)
+                x_cl = sigma_clip(x_raw, sigma=3, maxiters=5)
+                y_cl = sigma_clip(y_raw, sigma=3, maxiters=5)
+                m = (~x_cl.mask) & (~y_cl.mask)
+                if not np.any(m):
+                    xs, ys, ws = x_raw, y_raw, np.clip(snr, 1e-6, None)
+                else:
+                    xs, ys, ws = x_cl.data[m], y_cl.data[m], np.clip(snr[m], 1e-6, None)
+
+                x_w = float(np.average(xs, weights=ws))
+                y_w = float(np.average(ys, weights=ws))
+                x_var = float(np.average((xs - x_w)**2, weights=ws))
+                y_var = float(np.average((ys - y_w)**2, weights=ws))
+                x_std = np.sqrt(max(x_var, 0.0))
+                y_std = np.sqrt(max(y_var, 0.0))
+
+                payload = {
+                    'x_weight': x_w,
+                    'y_weight': y_w,
+                    'x_weight_std': x_std,
+                    'y_weight_std': y_std,
+                    'int_SNR': snr_sum,
+                    'frame_min': int(g['frame'].min()),
+                    'frame_max': int(g['frame'].max()),
+                    'rows': g.index.to_numpy()
+                }
+
+                if (best is None) or (weight_for_selection > best):
+                    best = weight_for_selection
+                    best_payload = payload
+
+            if best_payload is None:
+                continue
+
+            # Keep only the winning micro rows for this big cluster and attach the stats
+            gbest = corr.loc[best_payload['rows']].copy()
+            gbest['cluster'] = new_cluster_id  # new compact cluster id expected by your downstream code
+            gbest['x_weight'] = best_payload['x_weight']
+            gbest['y_weight'] = best_payload['y_weight']
+            gbest['x_weight_std'] = best_payload['x_weight_std']
+            gbest['y_weight_std'] = best_payload['y_weight_std']
+            gbest['int_SNR'] = best_payload['int_SNR']
+            gbest['frame_min'] = best_payload['frame_min']
+            gbest['frame_max'] = best_payload['frame_max']
+
+            refined_rows.append(gbest)
+            new_cluster_id += 1
+
+        if not refined_rows:
+            return None
+        refined = pd.concat(refined_rows, ignore_index=True)
+
+        # Keep only the columns you need; but having the weights on every row is handy downstream
+        return refined
 
     def detected_events(self, events, siglim=2.0):
+        
+        mjds_list = []
+        lc_fluxes_list = []
+        lc_fluxes_err_list = []
+        
         cluster_ids = np.unique(events['cluster'])
 
         full_events = pd.DataFrame(columns=['cluster', 'frame_min', 'frame_max',
                                             'true_start', 'true_end',
-                                            'remapped_frame_min', 'remapped_frame_max', 'x', 'y', 'xstd', 'ystd', 
-                                            'sig_max', 'sig_84', 'mjds', 'flux', 'flux_err',
-                                            'roundness', 'fwhm', 'snr', 'psfdiff', 'correlation', 
-                                            'poisson_thresh', 'smoothness_ratio', 'e_roundness', 'e_fwhm', 'e_snr', 'e_psfdiff', 
+                                            'remapped_frame_min', 'remapped_frame_max', 
+                                            'x', 'y', 'xstd', 'ystd', 'sig_max', 'sig_95', 
+                                            'roundness', 'fwhm', 'snr', 'psfdiff', 
+                                            'correlation', 'poisson_thresh', 'smoothness_ratio', 
+                                            'period', 'period_confidence', 
+                                            'lc_snr_max', 'lc_snr_95',
+                                            'e_roundness', 'e_fwhm', 'e_snr', 'e_psfdiff', 
                                             'e_correlation', 'e_poisson_thresh'])
 
         new_stars = pd.DataFrame(columns=events.columns)
@@ -441,65 +585,60 @@ class Implement_reductions:
         for cid in cluster_ids:
             cluster = events[events['cluster'] == cid]
             
-            print(f'CID: {cid}')
             if len(cluster) < self.det_min_pts:
                 continue
             
-            print(f'PASS 1, len(cluster): {len(cluster)}')
-            # centroid compactness (loose, pre-LC)
-            x, _, xstd = sigma_clipped_stats(cluster['xcentroid'].values, sigma=3)
-            y, _, ystd = sigma_clipped_stats(cluster['ycentroid'].values, sigma=3)
-            
-            # x = float(cluster['x_weighted'].iloc[0])
-            # y = float(cluster['x_weighted'].iloc[0])
-            # xstd = float(cluster['xstd_weighted'].iloc[0])
-            # ystd = float(cluster['ystd_weighted'].iloc[0])
+            x = float(cluster['x_weight'].iloc[0])
+            y = float(cluster['y_weight'].iloc[0])
+            xstd = float(cluster['x_weight_std'].iloc[0])
+            ystd = float(cluster['y_weight_std'].iloc[0])
             
             if (xstd >= self.dist_cut) | (ystd >= self.dist_cut):
                 continue
 
-            print(f'PASS 2 pos_std: {xstd}, {ystd}')
-            frame_min = int(cluster['frame'].min())
-            frame_max = int(cluster['frame'].max())
-            
-            print(f"frame_min:{frame_min}, max: {frame_max}, x: {x:.2f}, y: {y:.2f}")
+            frame_min = int(cluster['frame_min'].iloc[0])
+            frame_max = int(cluster['frame_max'].iloc[0])
 
             # --- build LC at the centroid for this cluster ---
             bjds = deepcopy(self.time)
             lc_raw   = forced_photometry(self.diff,  x, y, self.epsf)
             flux_err = forced_photometry(self.noise, x, y, self.epsf)
-            # lc_raw, flux_err = forced_photometry_psf(self.diff, self.noise, x, y, self.epsf, bkg=True, method='psf')
-            
-            np.save('lc_flux.npy', lc_raw)
-            np.save('lc_time.npy', bjds)
-            np.save('lc_flux_err.npy', flux_err)
-            
-            # og_ind = np.arange(len(lc_raw))
 
             mfin = np.isfinite(lc_raw) & np.isfinite(bjds) & np.isfinite(flux_err)
+            
             bjds, lc_raw, flux_err = bjds[mfin], lc_raw[mfin], flux_err[mfin]
+            
+            og_ind = np.where(mfin)[0]  # original frame indices
+            rmap_ind = np.arange(lc_raw.size)
+            
+            fr_min = rmap_ind[og_ind == frame_min][0] if np.any(og_ind == frame_min) else 0
+            fr_max = rmap_ind[og_ind == frame_max][0] if np.any(og_ind == frame_max) else (len(rmap_ind)-1)
+            
+            _, best_period, confidence = check_periodicity(bjds, flux=lc_raw, flux_err=flux_err, fap_level=0.075)
+            
+            if confidence < 0.75:
+                best_period = 0                
 
-            # print('G SMOOTH START')
-            # lc_sm, lc_sm_err = gauss_smooth(bjds, lc_raw) # smooth for significance
-            lc_sm = lc_raw.copy()
-            lc_sm_err = flux_err.copy()
-            # print('G SMOOTH END')
+            lc_sm, lc_sm_err = gauss_smooth(bjds, lc_raw, flux_err) # smooth for significance
+            # lc_sm = lc_raw.copy()
+            # lc_sm_err = flux_err.copy()
+            
+            # lc_sm_err = np.maximum(np.sqrt(lc_sm_err**2 + flux_err**2), 1e-6)
+            
+            lc_snr = lc_sm/lc_sm_err
 
             # 2) find iterative baseline & z on smoothed LC (fast mode, no GP refit)
             args = iterative_baseline_zscore_fast(time=bjds, flux_smooth=lc_sm, raw_flux=lc_raw, 
-                                                  flux_err=lc_sm_err, frame_min=frame_min, 
-                                                  frame_max=frame_max, base_w=21, z_enter_base=siglim,   # your z_enter default
+                                                  flux_err= lc_sm_err,
+                                                  frame_min=fr_min, frame_max=fr_max, 
+                                                  base_w=21, z_enter_base=siglim,   # your z_enter default
                                                   z_exit=1.0, persist=2, want_baseline_pts=60, 
                                                   pad_frac=0.5, max_iter=3, rolling_w_for_adapt=200)
             
             istart, iend, lc_sig, med, mad, baseline_mask, err_model = args
-            
-            print(istart, iend)
 
             if istart is None:
                 continue
-            
-            print(f'PASS 3 istart not None')
 
             residual = lc_sm - med
             win_lo = max(0, istart)
@@ -507,7 +646,7 @@ class Implement_reductions:
             zevt = np.abs(lc_sig[win_lo:win_hi]) if win_hi > win_lo else np.array([])
 
             sig_max = float(np.nanmax(zevt)) if zevt.size else -1.0
-            sig_84  = float(np.nanpercentile(zevt, 84)) if zevt.size else -1.0
+            sig_95  = float(np.nanpercentile(zevt, 95)) if zevt.size else -1.0
 
             if istart is not None and iend is not None and (iend - istart) >= 12:
                 sm_win = slice(istart + 2, iend + 1)
@@ -517,11 +656,8 @@ class Implement_reductions:
             else:
                 ratio = np.nan
 
-            if sig_84 < siglim:
+            if sig_95 < siglim:
                 continue
-            
-            print(f'PASS 4 SIG84: {sig_84}')
-            print(f'Ratio {ratio}')
             
             if ~np.isfinite(ratio):
                 continue
@@ -529,22 +665,13 @@ class Implement_reductions:
             if (ratio >= self.ratio_cut):
                 continue
             
-            print(f'PASS 5: {ratio}')
-            
-            og_ind = np.where(mfin)[0]  # original frame indices
-            rmap_ind = np.arange(lc_sig.size)
-
             filtered_cluster = cluster[cluster['frame'].isin(og_ind)].reset_index(drop=True)
             if len(filtered_cluster) < self.det_min_pts:
                 continue
             
-            print(f'PASS 6 len(cluster): {len(filtered_cluster)}')
-            
-            # np.save('lc_significance.npy', np.column_stack([bjds, lc_sm, lc_sm_err, lc_sig]))
-            # print('ZZZ \n', 
-            #       'ISTART & END \n', istart, iend, '\n',
-            #       'FRAME MIN & MAX \n', 
-            #       int(filtered_cluster['frame'].min()), int(filtered_cluster['frame'].max()))
+            lc_snr_event = lc_snr[win_lo:win_hi]
+            lc_snr_max = np.nanmax(lc_snr_event)
+            lc_snr_95 = np.nanpercentile(lc_snr_event, 95)
 
             map_inds = np.array([np.where(og_ind == int(fr))[0][0] for fr in filtered_cluster['frame'].values])
             filtered_cluster = filtered_cluster.assign(lc_sig=lc_sig[map_inds])
@@ -557,6 +684,10 @@ class Implement_reductions:
             psfdiff, _, e_psfdiff = sigma_clipped_stats(filtered_cluster['psfdiff'].values, sigma=3)
             correlation, _, e_correlation = sigma_clipped_stats(filtered_cluster['correlation'].values, sigma=3)
             poisson_thresh, _, e_poisson_thresh = sigma_clipped_stats(filtered_cluster['poisson_thresh'].values, sigma=3)
+            
+            masking = self.mask_detections(correlation, psfdiff, fwhm, snr, roundness, poisson_thresh, xstd, ystd, lc_snr_95)
+            if masking is False:
+                continue
 
             bjds_utc = bjds + 54832.5
             t_bary = Time(bjds_utc, format="mjd", scale="tdb")
@@ -565,43 +696,68 @@ class Implement_reductions:
             rmap_lo = rmap_ind[og_ind == istart][0] if np.any(og_ind == istart) else 0
             rmap_hi = rmap_ind[og_ind == iend][0] if np.any(og_ind == iend) else (len(rmap_ind)-1)
             
+            mjds_list.append([t_mjd_utc])
+            lc_fluxes_list.append([lc_sm])
+            lc_fluxes_err_list.append([lc_sm_err])
+            
             # store event
             full_events.loc[len(full_events)] = [
-                len(full_events) + 1,
-                istart, iend,
-                t_mjd_utc[istart], 
-                t_mjd_utc[iend], 
-                rmap_lo, rmap_hi,
-                x, y, xstd, ystd,
-                sig_max, sig_84,
-                t_mjd_utc, lc_sm, lc_sm_err,
-                roundness, fwhm, snr, psfdiff, correlation, poisson_thresh, ratio,
-                e_roundness, e_fwhm, e_snr, e_psfdiff, e_correlation, e_poisson_thresh
+                len(full_events) + 1, # cluster
+                istart, iend, # frame_min, frame_max
+                t_mjd_utc[istart], # true_start
+                t_mjd_utc[iend], # true_end
+                rmap_lo, rmap_hi, # remapped_frame_min, remapped_frame_max
+                x, y, xstd, ystd, # x, y, xstd, ystd
+                sig_max, sig_95, # sig_max, sig_95
+                roundness, fwhm, snr, psfdiff, # roundness, fwhm, snr, psfdiff
+                correlation, poisson_thresh, ratio, # correlation, poisson_thresh, smoothness_ratio
+                best_period, confidence, # period, period_confidence
+                lc_snr_max, lc_snr_95,
+                e_roundness, e_fwhm, e_snr, e_psfdiff, # e_roundness, e_fwhm, e_snr, e_psfdiff
+                e_correlation, e_poisson_thresh # e_correlation, e_poisson_thresh
             ]
 
         if len(full_events) == 0:
-            return None, None
+            return None, None, None, None, None
         else:
             new_stars = new_stars.reset_index(drop=True)
-            return full_events, new_stars
+            return full_events, new_stars, np.array(mjds_list), np.array(lc_fluxes_list), np.array(lc_fluxes_err_list)
 
-    def downweight_overlapping_events(self, full_events, time_overlap_thresh=0.5):
+class EventProcessor:
+    def __init__(self, time_overlap_thresh=0.5):
+        self.time_overlap_thresh = time_overlap_thresh
+
+    def build_cluster_events(self, groups: pd.DataFrame) -> pd.DataFrame:
         """
-        Downweight events that overlap in time across many frames.
-        time_overlap_thresh: fraction of overlap that triggers downweight
+        Build per-cluster summary events table.
         """
-        if full_events is None or len(full_events) < 2:
-            full_events['overlap_factor'] = 1
-            full_events['sig_max_weighted'] = full_events['sig_max']
-            return full_events
-        
-        # Build an array of event time ranges
-        starts = full_events['remapped_frame_min'].values
-        ends   = full_events['remapped_frame_max'].values
-        n_events = len(full_events)
-        
-        overlap_factor = np.ones(n_events)  # start with no downweight
-        
+        events = []
+        for cid, dfc in groups.groupby("cluster"):
+            frame_min, frame_max = dfc["frame"].min(), dfc["frame"].max()
+            int_SNR = dfc["int_SNR"].values[0]  # or weighted sum if you prefer
+            events.append({
+                "cluster": cid,
+                "frame_min": frame_min,
+                "frame_max": frame_max,
+                "int_SNR": int_SNR,
+                "n_points": len(dfc),
+            })
+        return pd.DataFrame(events)
+
+    def remove_overlapping_clusters(self, events: pd.DataFrame) -> pd.DataFrame | None:
+        """
+        Removes overlapping cluster events, keeping the stronger one (by int_SNR).
+        """
+        if events is None or len(events) < 2:
+            return events
+
+        starts = events['frame_min'].values
+        ends   = events['frame_max'].values
+        snrs   = events['int_SNR'].values
+        n_events = len(events)
+
+        to_remove = np.zeros(n_events, dtype=bool)
+
         for i in range(n_events):
             for j in range(i+1, n_events):
                 lo = max(starts[i], starts[j])
@@ -610,11 +766,26 @@ class Implement_reductions:
                 if overlap > 0:
                     frac_i = overlap / (ends[i] - starts[i] + 1)
                     frac_j = overlap / (ends[j] - starts[j] + 1)
-                    if frac_i >= time_overlap_thresh or frac_j >= time_overlap_thresh:
-                        # simple downweight: e.g., reduce sig_max by factor
-                        overlap_factor[i] *= 0.5
-                        overlap_factor[j] *= 0.5
+                    if frac_i >= self.time_overlap_thresh or frac_j >= self.time_overlap_thresh:
+                        # Keep the stronger event, drop the weaker one
+                        if snrs[i] >= snrs[j]:
+                            to_remove[j] = True
+                        else:
+                            to_remove[i] = True
 
-        full_events['overlap_factor'] = overlap_factor
-        full_events['sig_max_weighted'] = full_events['sig_max'] * overlap_factor
-        return full_events
+        filtered = events[~to_remove].reset_index(drop=True)
+        return filtered if not filtered.empty else None
+
+    def filter_detections_by_clusters(self, groups: pd.DataFrame) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+        """
+        High-level: build events -> filter overlaps -> return surviving events and detections.
+        """
+        events = self.build_cluster_events(groups)
+        filtered_events = self.remove_overlapping_clusters(events)
+
+        if filtered_events is not None:
+            survivor_clusters = set(filtered_events["cluster"])
+            groups = groups[groups["cluster"].isin(survivor_clusters)]
+            return filtered_events, groups
+        else:
+            return None, None

@@ -430,12 +430,11 @@ class Kakapo():
                 return result
 
             # Run in parallel
-            results = Parallel(n_jobs=num_cores, backend="loky")(
+            results = Parallel(n_jobs=num_cores, backend="threading")(
                 delayed(_process_wrapper)(job) for job in jobs
             )
 
             progress_bar.close()
-
                 
         else:
             if tpf_info['mission'].iloc[0] == 'Kepler':
@@ -642,6 +641,9 @@ class Kakapo():
 
         filtered_stars = impred.filtered_stars
         full_events = impred.full_events
+        lc_mjds_arr = impred.lc_mjds_arr
+        lc_flux_arr = impred.lc_flux_arr
+        lc_flux_err_arr = impred.lc_flux_err_arr
 
         if (filtered_stars is not None) & (full_events is not None):
                 
@@ -668,9 +670,9 @@ class Kakapo():
             full_events.to_csv(full_events_file_name, index=False)
             
             for i in range(len(full_events)):
-                mjds = np.array(full_events['mjds'].iloc[i])
-                fluxes = np.array(full_events['flux'].iloc[i])
-                flux_err = np.array(full_events['flux_err'].iloc[i])
+                mjds = lc_mjds_arr[i].flatten()
+                fluxes = lc_flux_arr[i].flatten()
+                flux_err = lc_flux_err_arr[i].flatten()
                 
                 cluster_number = int(full_events['cluster'].iloc[i])
                 x = full_events['x'].iloc[i]
