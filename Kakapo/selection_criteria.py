@@ -143,7 +143,7 @@ def iterative_baseline_zscore_fast(time,
     for it in range(max_iter):
         evt_len = max(1, prev_iend - prev_istart + 1)
         
-        pad = int(max(10, min(int(0.1 * N), pad_frac * evt_len)))
+        pad = int(max(20, min(int(0.1 * N), pad_frac * evt_len)))
         mask_transient = np.zeros(N, bool)
         mask_transient[max(0, prev_istart - pad): min(N, prev_iend + pad + 1)] = True
         baseline_mask = (~mask_transient) & finite
@@ -281,7 +281,7 @@ def find_event_window_from_z(z, z_enter=2.5, z_exit=1.0, persist=2, exit_frac=0.
 class Implement_reductions:
     def __init__(self, stars, tpf_info, diff, epsf_data, 
                  noise, corrlim=0, difflim=100, 
-                 fwhmlim=5, maxlim=10, snrlim=1, roundness=0.8, 
+                 fwhmlim=5, maxlim=10, snrlim=2, roundness=0.8, 
                  poiss_val=1, siglim=1, dist_cut=0.6, ratio_cut = 2,
                  f_dist=50):
         
@@ -395,7 +395,7 @@ class Implement_reductions:
             corr = stars[(stars.correlation >= 0.01) & 
                          (stars.psfdiff <= 2) & 
                          (stars.fwhm <= 8) &  (stars.fwhm >= 0.8) & 
-                         (stars.snr >= 1) & (stars.snr < 10000) & 
+                         (stars.snr >= 2) & (stars.snr < 10000) & 
                          (abs(stars.roundness) <= 0.99) & 
                          (stars.poisson_thresh >= 1)]
         else:
@@ -623,7 +623,7 @@ class Implement_reductions:
             # lc_sm = lc_raw.copy()
             # lc_sm_err = flux_err.copy()
             
-            # lc_sm_err = np.maximum(np.sqrt(lc_sm_err**2 + flux_err**2), 1e-6)
+            lc_sm_err = np.maximum(np.sqrt(lc_sm_err**2 + flux_err**2), 1e-6)
             
             lc_snr = lc_sm/lc_sm_err
 

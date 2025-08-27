@@ -47,7 +47,15 @@ class Difference_Imaging():
         
         self.ref_shape = self.ref.shape
         
+        self._original_background_factor(self.flux, self.flux_err)
+        
         self._minimisation_routine()
+        
+        self.distance = np.sqrt(self.dxs**2 + self.dys**2)
+        
+        # motion_factors = self._motion_inflation(self.distance)
+        # self.motion_factors = motion_factors
+        
         self.compute_difference_images_with_psf()
         
         dist_mask = np.sqrt(self.dxs**2 + self.dys**2) > 2.5
@@ -63,9 +71,7 @@ class Difference_Imaging():
         
         # true_poisson_variance_stack = np.clip(np.abs(self.flux), a_min=1.0, a_max=None) / self.exptime
         
-        self.diff_noise = 2*self.diff_noise_model.copy()# np.sqrt(self.true_noise**2 + self.true_ref_noise**2)# + self.diff_noise_model**2)
-        
-        self.distance = np.sqrt(self.dxs**2 + self.dys**2)
+        self.diff_noise = self.diff_noise_model.copy()# np.sqrt(self.true_noise**2 + self.true_ref_noise**2)# + self.diff_noise_model**2)
 
     def _detect_jump_discontinuities(self, sigma_thresh=8):
         median = np.nanmedian(self.jump_metrics)
@@ -215,6 +221,7 @@ class Difference_Imaging():
     def _minimisation_routine(self):
         dxs, dys, chi2s = [], [], []
         bkg_var_list = []
+        saving_bkg = []
     
         # for i in tqdm(range(len(self.flux)), desc='Frames'):
         for i in range(len(self.flux)):
@@ -223,6 +230,7 @@ class Difference_Imaging():
                 dxs.append(np.nan)
                 dys.append(np.nan)
                 bkg_var_list.append(np.nan*np.ones_like(self.flux[i]))
+                saving_bkg.append(np.nan)
                 continue
             
             transient_mask = self._psf_matched_mask(self.flux[i], self.psf, 
@@ -231,7 +239,7 @@ class Difference_Imaging():
             bkg_result = self._fit_background_plane_fast(self.flux[i], mask = transient_mask)
             bkg = bkg_result['background']
             # bkg_err = bkg_result['bg_rms']
-            
+            saving_bkg.append(np.nanmedian(bkg))
             bkg_var = np.clip(np.abs(bkg), a_min=1.0, a_max=None) / self.exptime
 
             self.flux[i] -= bkg
@@ -240,7 +248,7 @@ class Difference_Imaging():
             
             # self.noise[i] = np.sqrt(self.noise[i]**2 + bkg_var)
             
-            (dx, dy), chi2 = self.compute_shift(self.flux[i], self.noise[i])
+            (dx, dy), chi2 = self.compute_shift(self.flux[i], self.noise[i] * self.bkg_factors[i])
 
             dxs.append(dx)
             dys.append(dy)
@@ -250,6 +258,7 @@ class Difference_Imaging():
         self.dys = np.array(dys)
         self.chi2s = np.array(chi2s)
         self.bkg_var_arr = np.array(bkg_var_list)
+        np.save('bkg_evol.npy', np.array(saving_bkg))
         
     def _tukey2d(self, h, w, alpha=0.5):
         def tukey(n, a): # separable 1D tukey
@@ -266,7 +275,7 @@ class Difference_Imaging():
         ty = tukey(h, alpha)
         return np.outer(ty, tx)
     
-    def huber(self, r, delta=3.0):
+    def _huber(self, r, delta=3.0):
         a = np.abs(r)
         quad = a <= delta
         out = np.empty_like(a)
@@ -327,10 +336,13 @@ class Difference_Imaging():
         dx, dy = shift_params
         
         frame_shifted = self._shift_fourier(flux_frame, dx, dy) # Shift science frame and its noise
-        noise_shifted = self._shift_fourier(flux_noise_frame**2, dx, dy)
+        noise_shifted = self._shift_fourier((flux_noise_frame)**2, dx, dy)
 
         ref = self.ref # Reference frame and noise
         ref_noise = self.ref_noise
+        
+        r = np.sqrt(dx**2 + dy**2)
+        # alpha_motion = self._motion_inflation(r)
         
         tukeying = self._tukey2d(*ref.shape, alpha=0.5)
 
@@ -364,7 +376,7 @@ class Difference_Imaging():
             ref_var_c = self.safe_fftconvolve(self.true_ref_noise**2, self.psf**2)
             frm_var_c = self.safe_fftconvolve(true_frame_err**2, self.psf**2)
 
-            diff_sig  = np.sqrt(ref_var_c + frm_var_c)
+            diff_sig  = np.sqrt(ref_var_c + frm_var_c*self.bkg_factors[i])
             diff_sig = np.sqrt(np.maximum(diff_sig, 1e-6))
             
             diff_clean = shifted - ref #- bkg_final
@@ -468,3 +480,31 @@ class Difference_Imaging():
         bg_rms = np.nanstd(residuals, ddof = 1)
 
         return {'background': background, 'bg_rms': bg_rms}
+    
+    def _original_background_factor(self, flux, flux_err):
+        bkgs = []
+
+        for i in range(len(flux)):
+
+            temp_data = flux[i]
+            temp_data_err = flux_err[i]
+            temp_data[temp_data < 0] = 0.05
+            
+            bkg = np.nanmedian(np.sqrt(temp_data_err**2 - (np.sqrt(temp_data*self.exptime)/self.exptime)**2 - (95/self.exptime)**2))
+            
+            if np.isfinite(bkg) & np.isfinite(self.time_kp.value[i]):
+                bkgs.append(bkg)
+            else:
+                bkgs.append(np.nan)
+            
+        bkgs = np.array(bkgs)
+        bkgs /= np.nanpercentile(bkgs, 2)
+        bkgs = np.clip(bkgs, 1, 5)
+        self.bkg_factors = bkgs
+        
+    def _motion_inflation(self, r):
+        fmax=5.0
+        p=1.2
+        r = np.asarray(r, float)
+        f = 1.0 + (r / self.tol/3)**p
+        return np.sqrt(np.clip(f, 1.0, fmax))

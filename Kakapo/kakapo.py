@@ -28,11 +28,10 @@ from multiprocessing import Pool, cpu_count
 from tqdm.auto import tqdm as auto_tqdm
 import threading
 
-# from Kakapo.difference_image import create_diff_image
 from Kakapo.difference_image import Difference_Imaging
 from Kakapo.selection_criteria import Implement_reductions
-from Kakapo.photometry import forced_photometry
-from Kakapo.cleaning_curve import correction_smoothing_lightcurve, wavelet_denoise, gauss_smooth, binned_averages
+from Kakapo.cleaning_curve import binned_averages
+from Kakapo.tqdm_joblib import tqdm_joblib
 
 import warnings
 
@@ -217,14 +216,14 @@ def main_correlation(diff, found, downsampled_array):
         stars = [found]
     return stars
 
-def star_finding_procedure(data, downsampled_array, std1 = 3.0, std2 = 3.0):
+def star_finding_procedure(data, downsampled_array, noise, std1 = 3.0, std2 = 3.0):
 
     prf = downsampled_array
 
     tables = []
     for shift_y in np.arange(-0.5, 0.75, 0.25):
         for shift_x in np.arange(-0.5, 0.75, 0.25):
-            tables += [_finding_the_stars(data, prf, std1, std2, (shift_y, shift_x))]
+            tables += [_finding_the_stars(data, prf, noise, std1, std2, (shift_y, shift_x))]
     
     good_tables = [table for table in tables if table is not None]
     if len(good_tables)>0:
@@ -242,7 +241,7 @@ def star_finding_procedure(data, downsampled_array, std1 = 3.0, std2 = 3.0):
 
     return res
 
-def _finding_the_stars(data, prf, std1, std2, shifts):
+def _finding_the_stars(data, prf, noise, std1, std2, shifts):
     
     shift_y, shift_x = shifts
     mean, med, std = sigma_clipped_stats(data, sigma=std1)
@@ -252,7 +251,7 @@ def _finding_the_stars(data, prf, std1, std2, shifts):
     
     if res is not None:
         res = res.to_pandas()
-        res = find_stars(res, data)
+        res = find_stars(res, data, noise)
     
     return res
 
@@ -286,7 +285,7 @@ def spatial_group(result,distance=1.5,njobs=-1):
     result['objid'] = result['objid'].astype(int)
     return result
 
-def find_stars(star, data, negative=False):
+def find_stars(star, data, noise, negative=False):
     
     data[np.isnan(data)] = 0
     
@@ -312,11 +311,15 @@ def find_stars(star, data, negative=False):
     
     aperture = CircularAperture(pos, 1.91)
     phot_table = aperture_photometry(data, aperture)
+    phot_table_err = aperture_photometry(noise, aperture)
     phot_table = phot_table.to_pandas()
+    phot_table_err = phot_table_err.to_pandas()
     _, _, bkg_std = sigma_clipped_stats(data, sigma= 2)
-    star['snr'] = phot_table['aperture_sum'].values / (aperture.area * bkg_std)
+    
+    err = np.sqrt((aperture.area * bkg_std)**2 + (phot_table_err['aperture_sum'].values)**2)
+    star['snr'] = phot_table['aperture_sum'].values / err
     star['snr'] = np.clip(star['snr'], None, 10001)
-    star['flux_err'] = aperture.area * bkg_std
+    star['flux_err'] = err
     star['bkg_std'] = bkg_std
     star['flux'] = phot_table['aperture_sum'].values
     star['mag'] = -2.5*np.log10(phot_table['aperture_sum'].values)
@@ -367,7 +370,7 @@ def check_within_radius(array, x, y, radius=0.6):
 
 def process_frame(i, diff, downsampled_array, poisson_noise, std1, std2):
     m, med, std = sigma_clipped_stats(diff[i], sigma=std1)
-    found = star_finding_procedure(diff[i], downsampled_array[1:-1,1:-1], std1=std1, std2=std2)
+    found = star_finding_procedure(diff[i], downsampled_array[1:-1,1:-1], poisson_noise[i], std1=std1, std2=std2)
     stars = []
     if found is not None:
         found['frame'] = int(i)
@@ -420,21 +423,24 @@ class Kakapo():
             #         total=len(jobs), desc="TPFs (threads)"
             #     ))
             
-            lock = threading.Lock()
-            progress_bar = auto_tqdm(total=len(jobs), desc="TPFs (threads)", position=0)
+            # lock = threading.Lock()
+            # progress_bar = auto_tqdm(total=len(jobs), desc="TPFs (threads)", position=0)
 
             def _process_wrapper(job):
                 result = self._process_tpf(job)
-                with lock:
-                    progress_bar.update(1)
+                # with lock:
+                #     progress_bar.update(1)
                 return result
 
-            # Run in parallel
-            results = Parallel(n_jobs=num_cores, backend="threading")(
-                delayed(_process_wrapper)(job) for job in jobs
-            )
+            # # Run in parallel
+            # results = Parallel(n_jobs=num_cores, backend="threading")(
+            #     delayed(_process_wrapper)(job) for job in jobs
+            # )
 
-            progress_bar.close()
+            # progress_bar.close()
+            
+            with tqdm_joblib(tqdm(desc="My calculation", total=len(jobs))) as progress_bar:
+                results = Parallel(n_jobs=num_cores)(delayed(_process_wrapper)(job) for job in jobs)
                 
         else:
             if tpf_info['mission'].iloc[0] == 'Kepler':
