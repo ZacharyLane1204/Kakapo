@@ -53,9 +53,6 @@ class Difference_Imaging():
         
         self.distance = np.sqrt(self.dxs**2 + self.dys**2)
         
-        # motion_factors = self._motion_inflation(self.distance)
-        # self.motion_factors = motion_factors
-        
         self.compute_difference_images_with_psf()
         
         dist_mask = np.sqrt(self.dxs**2 + self.dys**2) > 2.5
@@ -274,14 +271,6 @@ class Difference_Imaging():
         tx = tukey(w, alpha)
         ty = tukey(h, alpha)
         return np.outer(ty, tx)
-    
-    def _huber(self, r, delta=3.0):
-        a = np.abs(r)
-        quad = a <= delta
-        out = np.empty_like(a)
-        out[quad] = 0.5 * (a[quad]**2)
-        out[~quad] = delta * (a[~quad] - 0.5*delta)
-        return out
 
     def compute_shift(self, frame, noise_frame):
 
@@ -518,49 +507,3 @@ class Difference_Imaging():
 
         diff_clean = shifted - ref 
         return diff_clean, diff_sig
-    
-    def _student_t_clean_whitened(self, D, sigma, nu=6.0, iters=2, use_mad_scale=True):
-        """
-        Input:
-            D      : difference image (H, W) or stack (T, H, W)
-            sigma  : per-pixel noise map, same shape as D
-            nu     : Student-t degrees of freedom (~4..8 good; 6 default)
-            iters  : small number of IRLS rounds (1-3 is fine)
-            use_mad_scale : keep thresholds meaningful under non-Gaussian tails
-        Returns:
-            R_clean : whitened, Student-t weighted residuals (same shape as D)
-            W       : final per-pixel weight map in quadratic form (same shape)
-        """
-        eps = 1e-12
-        R = np.divide(D, sigma + eps)  # whitened
-        valid = np.isfinite(R)
-        R = np.where(valid, R, 0.0)
-
-        def mad(x):
-            x = x[np.isfinite(x)]
-            if x.size == 0: return 1.0
-            return np.nanmedian(np.abs(x - np.nanmedian(x))) + eps
-
-        for _ in range(iters):
-            if use_mad_scale:
-                s = mad(R)
-                Rn = R / s
-            else:
-                Rn = R
-
-            # Student-t IRLS weight (quadratic weight)
-            W = (nu + 1.0) / (nu + Rn**2)
-
-            # Form the “cleaned whitened residuals” used for L2 detection:
-            # Equivalent to pre-multiplying by sqrt(weight).
-            R = np.sqrt(W) * R
-
-        # Final weights corresponding to the last iteration’s residuals
-        if use_mad_scale:
-            s = mad(R)
-            Rn = R / s
-        else:
-            Rn = R
-        W = (nu + 1.0) / (nu + Rn**2)
-        R_clean = np.sqrt(W) * R
-        return R_clean, W

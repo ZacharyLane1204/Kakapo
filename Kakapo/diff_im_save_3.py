@@ -151,11 +151,18 @@ class Difference_Imaging():
         
         self.persistent_mask = self._persistent_mask_from_stack(shifted_stack, self.psf, 
                                                                noise_map_stack = noise_stack, 
-                                                               min_fraction=0.9)
+                                                               min_fraction=0.6, snr_thresh=2.5)
         
-        ref = np.nanmedian(shifted_stack, axis=0)
-        init_ref_noise = np.nanmedian(noise_stack, axis=0)/np.sqrt(len(noise_stack)) * 1.253
-        bkg_result = self._fit_background_plane_fast(ref, mask = self.persistent_mask)
+        temp_ref = np.nanmedian(shifted_stack, axis=0)
+        temp_init_ref_noise = np.nanmedian(noise_stack, axis=0)/np.sqrt(len(noise_stack)) * 1.253
+        
+        # ref, init_ref_noise = self.refine_reference(shifted_stack, noise_stack, temp_ref, 
+        #                                             temp_init_ref_noise, snr_thresh=4.0, huber_delta=2.0)
+        
+        ref = temp_ref.copy()
+        init_ref_noise = temp_init_ref_noise.copy()
+        
+        bkg_result = self._fit_background_plane_fast(ref, mask = ~self.persistent_mask)
         
         bkg = bkg_result['background']
         
@@ -166,7 +173,7 @@ class Difference_Imaging():
         ref_noise = np.sqrt(init_ref_noise**2 + poisson_variance_ref + bkg_variance_ref)# + (bkg_err)**2)
         true_ref_noise = np.sqrt(init_ref_noise**2 + true_bkg_variance_ref)# + (bkg_err)**2)
         
-        ref -= bkg
+        # ref -= bkg
         
         self.ref = ref
         
@@ -174,7 +181,7 @@ class Difference_Imaging():
         self.ref_noise = ref_noise
         self.true_ref_noise = true_ref_noise
         
-    def _psf_matched_mask(self, img, psf, noise_map, snr_thresh=4.0, dilate_radius=1):
+    def _psf_matched_mask(self, img, psf, noise_map, snr_thresh=4.0, dilate_radius=2):
         """
         img: 2D science or reference frame (flux)
         psf: 2D normalized PSF (sum=1)
@@ -192,7 +199,7 @@ class Difference_Imaging():
         return mask
         
     def _persistent_mask_from_stack(self, flux_stack, psf, noise_map_stack=None,
-                                    snr_thresh=2, min_fraction=0.5, dilate_radius=2):
+                                snr_thresh=4, min_fraction=0.5, dilate_radius=1):
         """
         flux_stack: (N_frames, H, W)
         psf: 2D psf
@@ -206,7 +213,7 @@ class Difference_Imaging():
         masks = np.zeros_like(flux_stack, dtype=bool)
         for i in range(N):
             masks[i] = self._psf_matched_mask(flux_stack[i], psf, noise_map_stack[i], 
-                                             snr_thresh=snr_thresh, dilate_radius=1)
+                                             snr_thresh=snr_thresh, dilate_radius=2)
         
         counts = masks.sum(axis=0) # count frames where detection occurs at each pixel
         persistent = counts >= (min_fraction * N)
@@ -217,6 +224,7 @@ class Difference_Imaging():
       
     def _minimisation_routine(self):
         dxs, dys, chi2s = [], [], []
+        cs = []
         bkg_var_list = []
         saving_bkg = []
     
@@ -228,35 +236,33 @@ class Difference_Imaging():
                 dys.append(np.nan)
                 bkg_var_list.append(np.nan*np.ones_like(self.flux[i]))
                 saving_bkg.append(np.nan)
+                cs.append(np.nan)
                 continue
-            
-            transient_mask = self._psf_matched_mask(self.flux[i], self.psf, 
-                                                   self.noise[i], snr_thresh=2.0, dilate_radius=1)
-            
-            bkg_result = self._fit_background_plane_fast(self.flux[i], mask = transient_mask)
-            bkg = bkg_result['background']
-            bkg_err = bkg_result['bg_rms']
+                        
+            bkg, bkg_var = self._background_internal(self.flux[i], self.noise[i], snr_thresh = 2.5)
+            # self.flux[i] -= bkg
             saving_bkg.append(np.nanmedian(bkg))
-            bkg_var = np.clip(np.abs(bkg), a_min=1.0, a_max=None) / self.exptime
-
-            self.flux[i] -= bkg
-            
             bkg_var_list.append(bkg_var)
             
-            # self.noise[i] = np.sqrt(self.noise[i]**2 + bkg_var)
+            self.noise[i] = np.sqrt(self.noise[i]**2 + bkg_var*self.exptime + self.bkg_factors[i]**2)
+            self.true_noise[i] = np.sqrt(self.true_noise[i]**2 + bkg_var + self.bkg_factors[i]**2)
             
-            self.noise[i] = np.sqrt(self.noise[i]**2 + bkg_var*self.exptime + bkg_err**2 + (self.bkg_factors[i]-1)**2)
-            self.true_noise[i] = np.sqrt(self.true_noise[i]**2 + bkg_var + bkg_err**2 + (self.bkg_factors[i]-1)**2)
+            tukeying = self._tukey2d(*self.ref.shape, alpha=0.5)
+            initial_shift_guess, _, _ = phase_cross_correlation(np.nan_to_num(self.ref * self.persistent_mask  * tukeying), 
+                                                                np.nan_to_num(self.flux[i] * self.persistent_mask  * tukeying), 
+                                                                upsample_factor=200)
             
-            (dx, dy), chi2 = self.compute_shift(self.flux[i], self.true_noise[i])
+            (dx, dy), chi2 = self.compute_shift(self.flux[i], self.true_noise[i], initial_shift_guess)
 
             dxs.append(dx)
             dys.append(dy)
+            # cs.append(c)
             chi2s.append(chi2)
 
         self.dxs = np.array(dxs)
         self.dys = np.array(dys)
         self.chi2s = np.array(chi2s)
+        self.cs = np.array(cs)
         self.bkg_var_arr = np.array(bkg_var_list)
         np.save('bkg_evol.npy', np.array(saving_bkg))
         
@@ -275,22 +281,14 @@ class Difference_Imaging():
         ty = tukey(h, alpha)
         return np.outer(ty, tx)
 
-    def compute_shift(self, frame, noise_frame):
+    def compute_shift(self, frame, noise_frame, initial_shift_guess):
 
         def cost_fn(shift_params):
             return self._cost_function_safe(shift_params, frame, noise_frame)
         
-        tukeying = self._tukey2d(*self.ref.shape, alpha=0.5)
-        initial_shift_guess, _, _ = phase_cross_correlation(np.nan_to_num(self.ref * self.persistent_mask * tukeying), 
-                                                            np.nan_to_num(frame * self.persistent_mask * tukeying), 
-                                                            upsample_factor=100)
-        
-        # x0 = np.array([initial_shift_guess[1], initial_shift_guess[0], 0.0, 0.0])
         x0 = (initial_shift_guess[1], initial_shift_guess[0])
-        # bounds = [(-3.5, 3.5), (-3.5, 3.5), (np.deg2rad(-0.5), np.deg2rad(0.5)), (np.log(0.995), np.log(1.005))]
         bounds = [(-3.5, 3.5), (-3.5, 3.5)]
         
-        # result = minimize(cost_fn, x0 = x0, method = 'L-BFGS-B', bounds=bounds, tol = 1e-8)
         result = minimize(cost_fn, x0 = x0, method = 'Powell', bounds=bounds, tol = 1e-8)
         
         return result.x, result.fun
@@ -336,12 +334,13 @@ class Difference_Imaging():
         
         tukeying = self._tukey2d(*ref.shape, alpha=0.5)
 
-        denom = np.sqrt(noise_shifted + ref_noise**2 + 1e-12) # Variance-weighted difference
+        denom = np.sqrt(noise_shifted + ref_noise**2 + 0.05**2 + 1e-12) # Variance-weighted difference
         
         D = (frame_shifted - ref) / denom * tukeying
         
         nu = 10
-        cost = np.nansum((nu + 1) / 2.0 * np.log1p((D)**2 / nu)) + np.nansum(self._huber_cost(D, delta=2.0))
+        # cost = np.nansum((nu + 1) / 2.0 * np.log1p((D)**2 / nu))
+        cost = np.nansum(self._huber_cost(D, delta=2.0)) + np.nansum((nu + 1) / 2.0 * np.log1p((D)**2 / nu))
         
         return cost
         
@@ -364,7 +363,6 @@ class Difference_Imaging():
         
         self.diffs = np.array(diff_images)
         self.diff_noise_model = np.array(diff_noises)
-        # self.final_noise = np.array(diff_noises)
         self.jump_metrics = np.nansum(np.abs(np.diff(np.array(diff_images), axis=0)), axis=(1,2))
     
     def _shift_fourier(self, img, dx, dy, pad=20):
@@ -442,7 +440,7 @@ class Difference_Imaging():
 
         img_vals = image[mask] # 2. sigma‑clip (one pass, 5σ)
         med, std = np.nanmedian(img_vals), np.nanstd(img_vals)
-        bg_mask  = mask & (np.abs(image - med) < 3.0 * std)
+        bg_mask  = mask & (np.abs(image - med) < 5.0 * std)
 
         y_grid, x_grid = self._xy_grid(image.shape)
         x = x_grid[bg_mask].ravel()
@@ -454,7 +452,7 @@ class Difference_Imaging():
 
         background = coeffs[0] * x_grid + coeffs[1] * y_grid + coeffs[2]
         
-        residuals = image[bg_mask] - z  # residuals at valid pixels
+        residuals = background[bg_mask] - z  # residuals at valid pixels
         bg_rms = np.nanstd(residuals, ddof = 1)
 
         return {'background': background, 'bg_rms': bg_rms}
@@ -484,12 +482,10 @@ class Difference_Imaging():
         shifted = self._shift_fourier(flux, dx, dy)
 
         ref = self.safe_fftconvolve(self.ref, self.psf)
-
         shifted = self.safe_fftconvolve(shifted, self.psf)
 
-        # true_bkg_variance_ref = np.clip(np.abs(bkg), a_min=1.0, a_max=None) / self.exptime
         sigma_motion = self._sigma_from_motion(dx, dy)
-        true_frame_err = np.sqrt(true_noise**2 + sigma_motion**2)
+        true_frame_err = np.sqrt(0.05**2 + sigma_motion**2 + true_noise**2 )
 
         ref_var_c = self.safe_fftconvolve(self.true_ref_noise**2, self.psf**2)
         frm_var_c = self.safe_fftconvolve(true_frame_err**2, self.psf**2)
@@ -497,9 +493,9 @@ class Difference_Imaging():
         diff_sig  = np.sqrt(ref_var_c + frm_var_c)
         diff_sig = np.sqrt(np.maximum(diff_sig, 1e-6))
 
-        diff_clean = shifted - ref 
+        diff_clean = shifted - ref
         return diff_clean, diff_sig
-
+    
     def _huber_cost(self, D, delta=2.0):
         """
         Huber robust loss for residuals D.
@@ -509,10 +505,6 @@ class Difference_Imaging():
         quad = 0.5 * D**2
         lin = delta * (absD - 0.5*delta)
         return np.where(absD <= delta, quad, lin)
-  
-  
-  
-    
     
     def refine_reference(self, shifted_stack, noise_stack, temp_ref, init_ref_noise,
                          snr_thresh=4.0, huber_delta=2.0):
@@ -588,7 +580,7 @@ class Difference_Imaging():
         r = np.hypot(dx, dy)
         return float(np.clip(k_xy * r, 0.0, cap))
     
-    def _background_internal(self, frame, noise, snr_thresh = 2):
+    def _background_internal(self, frame, noise, snr_thresh = 2.5):
         transient_mask = self._psf_matched_mask(frame, self.psf, noise, snr_thresh=snr_thresh, dilate_radius=2)
         
         bkg_result = self._fit_background_plane_fast(frame, mask = transient_mask)
