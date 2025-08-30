@@ -28,6 +28,31 @@ from astropy.timeseries import LombScargle
 
 import matplotlib.pyplot as plt
 
+from scipy.optimize import curve_fit
+
+def _twoD_gaussian(coords, amp, x0, y0, sigma_x, sigma_y, theta, offset):
+    x, y = coords
+    xo = float(x0)
+    yo = float(y0)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    a = (cos_t**2)/(2*sigma_x**2) + (sin_t**2)/(2*sigma_y**2)
+    b = -(sin_t*cos_t)/(2*sigma_x**2) + (sin_t*cos_t)/(2*sigma_y**2)
+    c = (sin_t**2)/(2*sigma_x**2) + (cos_t**2)/(2*sigma_y**2)
+    g = offset + amp * np.exp(-(a*((x-xo)**2) + 2*b*(x-xo)*(y-yo) + c*((y-yo)**2)))
+    return g.ravel()
+
+def fit_psf_fwhm(psf):
+    y, x = np.indices(psf.shape)
+    x0, y0 = np.array(psf.shape) / 2
+    amp0 = psf.max() - psf.min()
+    offset0 = psf.min()
+    p0 = (amp0, x0, y0, 1.0, 1.0, 0.0, offset0)  # initial guess
+    popt, _ = curve_fit(_twoD_gaussian, (x, y), psf.ravel(), p0=p0)
+    _, _, _, sigma_x, sigma_y, _, _ = popt
+    fwhm_x = 2*np.sqrt(2*np.log(2)) * sigma_x
+    fwhm_y = 2*np.sqrt(2*np.log(2)) * sigma_y
+    return fwhm_x, fwhm_y, np.nanmean([fwhm_x, fwhm_y])
+
 def check_periodicity(times, flux=None, flux_err=None, fap_level=0.025):
     """
     Quick periodicity check. Returns (bool, period, confidence).

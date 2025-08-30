@@ -601,8 +601,8 @@ class Implement_reductions:
 
             # --- build LC at the centroid for this cluster ---
             bjds = deepcopy(self.time)
-            lc_raw   = forced_photometry(self.diff,  x, y, self.epsf)
-            flux_err = forced_photometry(self.noise, x, y, self.epsf)
+            lc_raw   = forced_photometry(self.diff,  x, y, self.epsf, bkg = False)
+            flux_err = forced_photometry(self.noise, x, y, self.epsf, bkg = False)
 
             mfin = np.isfinite(lc_raw) & np.isfinite(bjds) & np.isfinite(flux_err)
             
@@ -619,9 +619,9 @@ class Implement_reductions:
             if confidence < 0.75:
                 best_period = 0                
 
-            lc_sm, lc_sm_err = gauss_smooth(bjds, lc_raw, flux_err) # smooth for significance
-            # lc_sm = lc_raw.copy()
-            # lc_sm_err = flux_err.copy()
+            # lc_sm, lc_sm_err = gauss_smooth(bjds, lc_raw, flux_err) # smooth for significance
+            lc_sm = lc_raw.copy()
+            lc_sm_err = flux_err.copy()
             
             lc_sm_err = np.maximum(np.sqrt(lc_sm_err**2 + flux_err**2), 1e-6)
             

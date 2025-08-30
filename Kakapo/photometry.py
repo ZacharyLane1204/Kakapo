@@ -5,7 +5,7 @@ from photutils.background import LocalBackground, MMMBackground
 from photutils.aperture import RectangularAperture, RectangularAnnulus,CircularAperture, CircularAnnulus
 from photutils.aperture import ApertureStats, aperture_photometry
 
-from astropy.nddata import NDData
+from astropy.nddata import NDData, StdDevUncertainty
 from astropy.table import Table
 from astropy.modeling.fitting import LevMarLSQFitter, LinearLSQFitter
 from astropy.modeling import models, fitting
@@ -65,6 +65,7 @@ def forced_photometry_psf(diff, noise, x, y, epsf, bkg=True, method='psf'):
     for i in range(N_images):
         im = np.nan_to_num(diff[i], nan=0.0)
         im_noise = np.nan_to_num(noise[i], nan=np.inf)
+        # im_noise = 1
         
         # Local background subtraction (optional)
         if bkg:
@@ -85,6 +86,8 @@ def forced_photometry_psf(diff, noise, x, y, epsf, bkg=True, method='psf'):
         
         # Match PSF shape to cutout
         psf_cut = epsf[(y1c - y1):(y2c - y1), (x1c - x1):(x2c - x1)]
+        
+        # noise_cut = 1
         
         # PSF-weighted flux (matched filter)
         weight = psf_cut / (noise_cut**2 + 1e-12)
@@ -113,7 +116,7 @@ def _local_centroid(image, x, y, box_size=5):
     cy, cx = center_of_mass(subimg)
     return x1 + cx, y1 + cy
 
-def forced_photometry(diff, x, y, epsf, bkg = True, method = 'aperture'):
+def forced_photometry(diff, x, y, epsf, bkg = False, method = 'aperture'):
     
     if method.lower() == 'aperture':
         fluxes = _forced_aperture(diff, x, y, bkg)
@@ -124,18 +127,9 @@ def forced_photometry(diff, x, y, epsf, bkg = True, method = 'aperture'):
     
     return fluxes
 
-def pad_psf_to_image(epsf, shape):
-    """Center-pad a small PSF array to match the image shape."""
-    padded = np.zeros(shape)
-    psf_h, psf_w = epsf.shape
-    img_h, img_w = shape
-    start_y = (img_h - psf_h) // 2
-    start_x = (img_w - psf_w) // 2
-    padded[start_y:start_y+psf_h, start_x:start_x+psf_w] = epsf
-    return padded
-
 def _forced_aperture(diff, x, y, bkg = True):
     fluxes = []
+    ap_size = 1.91
     
     # epsf_norm = epsf / np.sum(epsf)
     
@@ -145,7 +139,9 @@ def _forced_aperture(diff, x, y, bkg = True):
             continue
         
         x_fit, y_fit = _local_centroid(diff[i], x, y, box_size=5)
-        aperture = CircularAperture([x_fit, y_fit], 1.91)
+        # x_fit = x
+        # y_fit = y
+        aperture = CircularAperture([x_fit, y_fit], ap_size)
         
         image = np.nan_to_num(diff[i], nan=0.0)
         
@@ -160,22 +156,6 @@ def _forced_aperture(diff, x, y, bkg = True):
     
     # fluxes = lowess_smooth_with_nans(np.array(fluxes))
     return np.array(fluxes)
-
-# def fit_background(image, psf_x, psf_y, r_exclude=1.91):
-#     y, x = np.indices(image.shape)
-
-#     r = np.sqrt((x - psf_x)**2 + (y - psf_y)**2)
-#     mask = (r > r_exclude) & np.isfinite(image)
-
-#     if np.sum(mask) < image.shape[0]*image.shape[1]*0.4:  # arbitrary threshold
-#         return np.full_like(image, np.nanmedian(image))
-
-#     p_init = models.Polynomial2D(degree=1) # Fit 2D polynomial to background-only pixels
-#     fit_p = fitting.LinearLSQFitter()
-#     p = fit_p(p_init, x[mask], y[mask], image[mask])
-
-#     background = p(x, y)
-#     return background
 
 def fit_background(image, psf_x, psf_y, r_exclude=1.91, nan_fallback=True):
     """
@@ -219,6 +199,8 @@ def _forced_psf(diff, x, y, epsf, bkg = True):
         image = np.nan_to_num(image, nan=0.0)
         
         x_fit, y_fit = _local_centroid(image, x, y, box_size=5)
+        # x_fit = x
+        # y_fit = y
         
         if bkg:
             background = fit_background(image, x_fit, y_fit)
@@ -230,7 +212,7 @@ def _forced_psf(diff, x, y, epsf, bkg = True):
         
         # shifted_psf = shifted_psf[1:-1,1:-1]
         
-        shifted_psf /= np.sum(shifted_psf)
+        shifted_psf /= np.nansum(shifted_psf)
 
         epsf_model = EPSFModel(shifted_psf)
         nddata = NDData(image)
@@ -248,3 +230,52 @@ def _forced_psf(diff, x, y, epsf, bkg = True):
         fluxes.append(fitted_flux)
 
     return np.array(fluxes)
+
+def forced_psf_photutils(image, x, y, epsf, noise_map):
+    # NDData with uncertainties for weighting
+    nd = NDData(image, uncertainty=StdDevUncertainty(noise_map))
+
+    # Photutils PSF model
+    psf_model = EPSFModel(epsf)
+
+    # Initial guess
+    positions = Table()
+    positions['x_0'] = [x]
+    positions['y_0'] = [y]
+
+    # Weighted fitter
+    fitter = LevMarLSQFitter(calc_uncertainties=True)
+
+    psf_phot = PSFPhotometry(
+        psf_model=psf_model,
+        fitter=fitter,
+        finder=None,
+        aperture_radius=1.91,
+        fit_shape=(5, 5)   # larger than PSF core for centroid leverage
+    )
+
+    result_tab = psf_phot(nd, init_params=positions)
+
+    flux     = result_tab['flux_fit'][0]
+    flux_err = result_tab['flux_fit_unc'][0] if 'flux_fit_unc' in result_tab.colnames else None
+
+    return flux, flux_err, result_tab
+
+def psf_wrapper(diff, x, y, epsf, noise_map):
+    fluxes = []
+    flux_errs = []
+
+    for i in range(len(diff)):
+        image = diff[i]
+
+        if np.isnan(image).sum() > image.size * 0.7:
+            fluxes.append(np.nan)
+            flux_errs.append(np.nan)
+            continue
+        
+        flux, flux_err, _ = forced_psf_photutils(image, x, y, epsf, noise_map[i])
+        
+        fluxes.append(flux)
+        flux_errs.append(flux_err)
+        
+    return np.array(fluxes), np.array(flux_errs)

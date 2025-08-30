@@ -28,7 +28,8 @@ from multiprocessing import Pool, cpu_count
 from tqdm.auto import tqdm as auto_tqdm
 import threading
 
-from Kakapo.difference_image import Difference_Imaging
+from Kakapo.difference_image_test import Difference_Imaging
+# from Kakapo.diff_im_save_state import Difference_Imaging
 from Kakapo.selection_criteria import Implement_reductions
 from Kakapo.cleaning_curve import binned_averages
 from Kakapo.tqdm_joblib import tqdm_joblib
@@ -489,7 +490,7 @@ class Kakapo():
 
         ref = chunky_bird.ref
         poisson_noise = chunky_bird.diff_noise
-        diff = chunky_bird.diffs
+        diff = chunky_bird.difference_images
         ref_frame_idx = chunky_bird.ref_frame
         
         # print(np.sum(np.isnan(diff)), np.count_nonzero(diff))
